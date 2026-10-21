@@ -2,18 +2,15 @@ import os
 import sys
 import time
 import json
-import base64
 import glob
 import subprocess
-import re
 from datetime import datetime
-from email.mime.text import MIMEText
 import requests
 
 FOLDER_ID = os.environ["FOLDER_ID"]
 CLEAN_NAME = os.environ["CLEAN_NAME"]
 LOG_FILE_ID = os.environ["LOG_FILE_ID"]
-NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
+NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "")
 DRIVE_TOKEN = os.environ["DRIVE_TOKEN"]
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -52,17 +49,12 @@ def log_step(msg):
     except Exception as e:
         print(f"تحذير تحديث اللوغ: {e}", flush=True)
 
-def send_gmail(subject, body):
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["to"] = NOTIFY_EMAIL
-    msg["subject"] = subject
-    raw_msg = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+def update_drive_folder(new_name, description_text=""):
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json"}
-    requests.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", headers=headers, json={"raw": raw_msg}, timeout=20)
-
-def rename_drive_folder(new_name):
-    headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json"}
-    requests.patch(f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}", headers=headers, json={"name": new_name}, timeout=15)
+    payload = {"name": new_name}
+    if description_text:
+        payload["description"] = description_text
+    requests.patch(f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}", headers=headers, json=payload, timeout=15)
 
 def upload_report_to_drive(filename, html_content):
     metadata = {"name": filename, "parents": [FOLDER_ID], "mimeType": "text/html"}
@@ -193,7 +185,6 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
         ("gemini-3.8-flash",       0,     "gemini-3.8-flash (Standard Fast)",            False)
     ]
     
-    # حساب أزمنة البداية لكل جزء لمساعدة النموذج على إعطاء توقيت متصل دقيق 100%
     audio_segs = sorted(glob.glob("Audio_part*.mp3"))
     seg_timeline_info = []
     accum_sec = 0.0
@@ -215,7 +206,7 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
         "5. أرجع كائن JSON حصراً بالحقول التالية:\n"
         "   - isFullDurationAnalyzed: (boolean)\n"
         "   - analyzedAllSegments: (boolean) يجب أن يكون true حصراً إذا تم تحليل كافة الأجزاء حتى الثانية الأخيرة.\n"
-        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل (مثال: '[00:54:30 - 00:54:54]: نشكر ضيفنا الكريم... إلى اللقاء في حلقة مقبلة').\n"
+        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.\n"
         "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل بالتوقيتات المتصلة.\n"
         "   - summarizedHtml: (string) التقرير المختصر."
     )
@@ -298,7 +289,14 @@ def main():
 
         elapsed = int(time.time() - START_TIME)
         elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
-        rename_drive_folder(f"PROCESSED_{CLEAN_NAME}")
+        
+        summary_desc = (
+            f"• عدد المقاطع المحللة: {total_segs_count} جزء\n"
+            f"• المدة الإجمالية للحلقة: {exact_duration}\n"
+            f"• الوقت المستغرق: {elapsed_str}\n"
+            f"• آخر كلام نُطق في ختام الحلقة (Verbatim):\n«{last_spoken}»"
+        )
+        update_drive_folder(f"PROCESSED_{CLEAN_NAME}", summary_desc)
 
         folder_url = f"https://drive.google.com/drive/folders/{FOLDER_ID}"
         send_telegram(
@@ -310,23 +308,14 @@ def main():
             f"«_{last_spoken}_»\n\n"
             f"📁 [رابط المجلد على الدرايف]({folder_url})"
         )
-        
-        send_gmail(
-            f"✅ اكتمل تقييم حلقة ({CLEAN_NAME}) بنجاح تام",
-            f"تم الانتهاء من تحليل وتغطية كامل مقاطع الحلقة ({total_segs_count} جزء) بمدة ({exact_duration}) حتى الخاتمة دون أي نقص، وإصدار التقارير النهائية.\n\n"
-            f"• الوقت المستغرق: {elapsed_str}\n"
-            f"• آخر كلام نُطق في ختام الحلقة:\n«{last_spoken}»\n\n"
-            f"📁 رابط الدرايف:\n{folder_url}"
-        )
     except Exception as e:
         log_step(f"❌ خطأ وفشل المهمة: {e}")
-        rename_drive_folder(f"FAILED_{CLEAN_NAME}")
+        update_drive_folder(f"FAILED_{CLEAN_NAME}", f"السبب: {e}")
         send_telegram(
             f"❌ *فشل معالجة الحلقة:* `{CLEAN_NAME}`\n"
             f"⚠️ التنبيه: تم رصد انتقاص أو خطأ في تحليل المقاطع.\n"
             f"📝 السبب: `{e}`"
         )
-        send_gmail(f"❌ فشل تقييم الحلقة: {CLEAN_NAME}", f"فشلت المهمة بسبب انتقاص أو عدم اكتمال تحليل المقاطع حتى النهاية.\n\nالسبب:\n{e}")
         sys.exit(1)
 
 if __name__ == "__main__":
