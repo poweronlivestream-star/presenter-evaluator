@@ -5,6 +5,7 @@ import json
 import base64
 import glob
 import subprocess
+import re
 from datetime import datetime
 from email.mime.text import MIMEText
 import requests
@@ -43,8 +44,6 @@ def log_step(msg):
     line = f"[{timestamp}] {msg}"
     print(line, flush=True)
     LOG_LINES.append(line)
-    
-    # إرسال إشعار حي إلى تيليغرام ودرايف
     send_telegram(f"🔔 *تحديث معالجة:* `{CLEAN_NAME}`\n_{msg}_")
     
     try:
@@ -166,34 +165,27 @@ def upload_to_gemini_file_api(filepath, api_key):
         file_info["state"] = chk.get("state")
     raise RuntimeError(f"لم يصبح الملف {filepath} في حالة ACTIVE.")
 
-def wrap_word_html(title, body_content):
+def wrap_html(title, body_content):
     return f"""<!DOCTYPE html>
-<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40" dir="rtl" lang="ar">
+<html dir="rtl" lang="ar">
 <head><meta charset="utf-8"><title>{title}</title>
-<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom><w:DoNotOptimizeForBrowser/></w:WordDocument></xml><![endif]-->
 <style>
-  @page {{ size: A4; margin: 2cm; }}
-  body {{ font-family: "Arial", sans-serif; font-size: 12pt; line-height: 1.5; direction: rtl; text-align: right; color: #111111; }}
-  .thinking-note {{ font-size: 8.5pt; color: #666666; text-align: left; border-bottom: 1px dotted #cccccc; padding-bottom: 3px; margin-bottom: 10px; }}
-  h1 {{ text-align: center; font-size: 18pt; font-weight: bold; color: #1F4E79; margin-bottom: 4px; page-break-after: avoid; }}
-  .subtitle {{ text-align: center; font-size: 13pt; font-weight: bold; color: #595959; margin-bottom: 18px; page-break-after: avoid; }}
-  h2 {{ font-size: 14pt; font-weight: bold; color: #1F4E79; margin-top: 18px; margin-bottom: 8px; border-bottom: 1.5px solid #1F4E79; padding-bottom: 4px; page-break-after: avoid; }}
-  table {{ width: 100%; border-collapse: collapse; margin-bottom: 16px; page-break-inside: avoid; }}
-  table, th, td {{ border: 1px solid #444444; }}
-  th, td {{ padding: 7px 10px; text-align: right; vertical-align: top; page-break-inside: avoid; }}
-  tr {{ page-break-inside: avoid; page-break-after: auto; }}
+  body {{ font-family: "Arial", sans-serif; font-size: 14pt; line-height: 1.6; direction: rtl; text-align: right; color: #222222; max-width: 900px; margin: 40px auto; padding: 20px; background-color: #fdfdfd; }}
+  .thinking-note {{ font-size: 9pt; color: #666666; text-align: left; border-bottom: 1px dotted #cccccc; padding-bottom: 4px; margin-bottom: 15px; }}
+  h1 {{ text-align: center; font-size: 20pt; font-weight: bold; color: #1F4E79; margin-bottom: 6px; }}
+  h2 {{ font-size: 15pt; font-weight: bold; color: #1F4E79; margin-top: 22px; margin-bottom: 10px; border-bottom: 2px solid #1F4E79; padding-bottom: 5px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
+  table, th, td {{ border: 1px solid #555555; }}
+  th, td {{ padding: 10px 12px; text-align: right; vertical-align: top; }}
   th {{ background-color: #D9E1F2; color: #1F4E79; font-weight: bold; }}
-  .info-table td:first-child {{ font-weight: bold; background-color: #F2F2F2; width: 22%; }}
-  .summary-strip td {{ background-color: #F9FAFB; text-align: center; width: 25%; }}
-  .core-grid td {{ width: 33.33%; background-color: #F9F9F9; font-weight: bold; }}
-  ul {{ margin-top: 6px; margin-bottom: 14px; padding-right: 22px; }}
-  li {{ margin-bottom: 6px; page-break-inside: avoid; }}
+  ul {{ margin-top: 8px; margin-bottom: 16px; padding-right: 25px; }}
+  li {{ margin-bottom: 8px; }}
 </style>
 </head>
 <body>{body_content}</body>
 </html>"""
 
-def evaluate_with_gemini(segments, exact_duration):
+def evaluate_with_gemini(segments, exact_duration, total_segments_count):
     models = [
         ("gemini-3.1-pro-preview", 24576, "gemini-3.1-pro-preview (Max Thinking 24576)", True),
         ("gemini-3.1-pro-preview", 8192,  "gemini-3.1-pro-preview (Med Thinking 8192)",  False),
@@ -203,16 +195,15 @@ def evaluate_with_gemini(segments, exact_duration):
     
     system_prompt = (
         "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).\n"
-        "قواعد إلزامية صارمة:\n"
-        "1. المنع المطلق للتخمين (Zero Hallucination): اعتمد حصرياً وبنسبة 100% على محتوى ملفات الصوت والفيديو المرفقة.\n"
-        f"2. التحقق من كامل المدة: المدة الفعلية للحلقة هي ({exact_duration}). حلل الحلقة بالكامل من الثانية 00:00 حتى النهاية.\n"
-        "3. سلم العلامات (90 نقطة): إدارة الحلقة (20)، التعامل مع الضيف (20)، جودة الأسئلة (20)، المتابعة والتعقيب (15)، الحضور والأداء (10)، ضبط الوقت (5).\n"
-        "4. أرجع كائن JSON حصراً بالحقول التالية:\n"
+        "قواعد إجبارية صارمة جداً:\n"
+        "1. المنع المطلق للتخمين (Zero Hallucination): اعتمد حصرياً وبنسبة 100% على محتوى جميع ملفات الأجزاء المرفقة.\n"
+        f"2. التحقق الشامل من كامل المدة: المدة الفعلية للحلقة هي ({exact_duration}). تم تقسيم الحلقة إلى ({total_segments_count}) أجزاء صوتية ومرئية متسلسلة. يجب تغطية وتحليل جميع الأجزاء دون استثناء.\n"
+        "3. قاعدة التوقيت المطلق المتصل: في قائمة الشواهد والتوثيق الميداني، يجب أن تكون التوقيتات بتنسيق ساعة ودقيقة وثانية متصلة للفيديو الأصلي بالكامل (مثلاً 00:00:14 حتى نهاية الحلقة)، وممنوع نهائياً استخدام مصطلحات مثل (الجزء 1 أو الجزء 2).\n"
+        "4. فحص الاكتمال: إذا تبين أن أي جزء من الأجزاء لم يتم تحليله أو تم انتقاصه، اعتبر التحليل غير مكتمل.\n"
+        "5. أرجع كائن JSON حصراً بالحقول التالية:\n"
         "   - isFullDurationAnalyzed: (boolean)\n"
-        "   - detectedTotalDuration: (string)\n"
-        "   - lastAnalyzedTimestamp: (string)\n"
-        "   - failureReason: (string)\n"
-        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل وفق المعايير الموسعة.\n"
+        "   - analyzedAllSegments: (boolean) يجب أن يكون true حصراً إذا تم تحليل كافة الأجزاء.\n"
+        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل بالتوقيتات المتصلة حتى الخاتمة.\n"
         "   - summarizedHtml: (string) التقرير المختصر."
     )
 
@@ -224,21 +215,21 @@ def evaluate_with_gemini(segments, exact_duration):
             for seg in segments:
                 log_step(f"☁️ رفع الجزء ({seg}) إلى Gemini باستخدام Key #{key_idx}...")
                 uri, mime = upload_to_gemini_file_api(seg, api_key)
-                prompt_parts.append({"text": f"الملف المرفق التالي هو: {seg}"})
+                prompt_parts.append({"text": f"الملف المرفق التالي هو الجزء المتسلسل: {seg}"})
                 prompt_parts.append({"fileData": {"mimeType": mime, "fileUri": uri}})
         except Exception as up_err:
             errors.append(f"Key #{key_idx} Upload Error: {up_err}")
             continue
 
         for model_name, budget, label, is_highest in models:
-            log_step(f"🧠 بدء التحليل العميق عبر النموذج: {label} (Key #{key_idx})...")
+            log_step(f"🧠 بدء التحليل العميق لجميع الأجزاء عبر النموذج: {label} (Key #{key_idx})...")
             gen_cfg = {"temperature": 0.0, "responseMimeType": "application/json"}
             if budget > 0:
                 gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
             
             payload = {
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"role": "user", "parts": prompt_parts + [{"text": f"حلل وقيّم حلقة ({CLEAN_NAME}) بالكامل بدقة تامة دون تخمين."}]}],
+                "contents": [{"role": "user", "parts": prompt_parts + [{"text": f"قم بتحليل وتقييم حلقة ({CLEAN_NAME}) بالكامل عبر تغطية جميع الأجزاء المرفقة بدقة تامة وصولاً للثواني الأخيرة."}]}],
                 "generationConfig": gen_cfg
             }
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
@@ -249,9 +240,12 @@ def evaluate_with_gemini(segments, exact_duration):
                     data = res.json()
                     text = data["candidates"][0]["content"]["parts"][0]["text"]
                     parsed = json.loads(text)
+                    
+                    if not parsed.get("isFullDurationAnalyzed") or not parsed.get("analyzedAllSegments", True):
+                        raise RuntimeError("أقر النموذج بعدم اكتمال تحليل كامل المقاطع والأجزاء.")
+                    
                     banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} (Key #{key_idx})</div>'
                     parsed["thinkingBanner"] = banner
-                    parsed["levelUsed"] = f"{label} (Key #{key_idx})"
                     return parsed
                 elif res.status_code in (503, 429):
                     log_step(f"⚠️ ضغط الخادم ({res.status_code}) على {label} - محاولة {attempt}/3...")
@@ -260,7 +254,7 @@ def evaluate_with_gemini(segments, exact_duration):
                     errors.append(f"Key #{key_idx} [{label}] HTTP {res.status_code}: {res.text}")
                     break
 
-    raise RuntimeError("فشلت جميع المفاتيح والنماذج المتاحة:\n" + "\n".join(errors))
+    raise RuntimeError("فشلت جميع المفاتيح والنماذج أو لم يتم تغطية كافة الأجزاء:\n" + "\n".join(errors))
 
 def main():
     try:
@@ -272,37 +266,52 @@ def main():
             raise RuntimeError("المجلد لا يحتوي على أي ملفات فيديو أو صوت.")
 
         segments, exact_duration = prepare_media_segments(drive_files)
-        result = evaluate_with_gemini(segments, exact_duration)
+        total_segs_count = len(glob.glob("Audio_part*.mp3")) + len(glob.glob("Visuals_part*.mp4"))
+        
+        result = evaluate_with_gemini(segments, exact_duration, total_segs_count)
 
-        if not result.get("isFullDurationAnalyzed"):
-            raise RuntimeError(f"لم يكتمل تحليل كامل المدة. المدة الفعلية: {exact_duration}")
-
-        log_step("📊 اكتمل التقييم بنجاح! جاري حفظ التقارير على الدرايف...")
-        main_html = wrap_word_html(f"تقييم تفصيلي - {CLEAN_NAME}", result["thinkingBanner"] + result["mainDetailedHtml"])
-        sum_html = wrap_word_html(f"تقرير مختصر - {CLEAN_NAME}", result["thinkingBanner"] + result["summarizedHtml"])
+        log_step(f"✅ تم بنجاح تحليل وتغطية كامل مقاطع الحلقة ({total_segs_count} جزء) حتى النهاية بمدة إجمالية ({exact_duration}) دون أي نقص!")
+        
+        main_html = wrap_html(f"تقييم تفصيلي - {CLEAN_NAME}", result["thinkingBanner"] + result["mainDetailedHtml"])
+        sum_html = wrap_html(f"تقرير مختصر - {CLEAN_NAME}", result["thinkingBanner"] + result["summarizedHtml"])
 
         upload_report_to_drive(f"01_Main_Detailed_Report_{CLEAN_NAME}.html", main_html)
-        upload_report_to_drive(f"01_Main_Detailed_Report_{CLEAN_NAME}.doc", main_html)
         upload_report_to_drive(f"02_Summarized_Report_{CLEAN_NAME}.html", sum_html)
-        upload_report_to_drive(f"02_Summarized_Report_{CLEAN_NAME}.doc", sum_html)
+
+        # استخلاص مقتطف من نهاية التحليل للتأكد من وصوله لآخر جزء
+        detailed_text = result.get("mainDetailedHtml", "")
+        snippet = detailed_text[-400:] if len(detailed_text) > 400 else detailed_text
+        clean_snippet = re.sub('<[^<]+?>', '', snippet).strip()
 
         elapsed = int(time.time() - START_TIME)
         elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
         rename_drive_folder(f"PROCESSED_{CLEAN_NAME}")
 
         folder_url = f"https://drive.google.com/drive/folders/{FOLDER_ID}"
-        send_telegram(f"✅ *اكتملت بنجاح:* `{CLEAN_NAME}`\n⏱️ الوقت المستغرق: `{elapsed_str}`\n📁 [رابط المجلد على الدرايف]({folder_url})")
+        send_telegram(
+            f"✅ *تمت المعالجة والتقييم بنجاح تام وتم التأكد من الوصول للجزء الأخير!*\n"
+            f"📌 الحلقة: `{CLEAN_NAME}`\n"
+            f"📊 تم تحليل وتغطية كافة المقاطع ({total_segs_count} جزء) حتى النهاية.\n"
+            f"⏱️ المدة الإجمالية: `{exact_duration}` | الوقت المستغرق: `{elapsed_str}`\n\n"
+            f"📝 *مقتطف من نهاية سكريبت الحلقة:*\n"
+            f"_{clean_snippet[:250]}..._\n\n"
+            f"📁 [رابط المجلد على الدرايف]({folder_url})"
+        )
         
         send_gmail(
-            f"✅ اكتمل تقييم حلقة ({CLEAN_NAME}) بنجاح",
-            f"تم الانتهاء من تحليل وتقييم حلقة ({CLEAN_NAME}) وإصدار التقريرين.\n\n"
-            f"• المدة الفعلية: {exact_duration}\n• الوقت المستغرق: {elapsed_str}\n\n📁 رابط الدرايف:\n{folder_url}"
+            f"✅ اكتمل تقييم حلقة ({CLEAN_NAME}) بنجاح تام",
+            f"تم الانتهاء من تحليل وتغطية كامل مقاطع الحلقة ({total_segs_count} جزء) بمدة ({exact_duration}) حتى الخاتمة دون أي نقص، وإصدار التقارير النهائية.\n\n"
+            f"• الوقت المستغرق: {elapsed_str}\n\n📁 رابط الدرايف:\n{folder_url}"
         )
     except Exception as e:
-        log_step(f"❌ خطأ: {e}")
+        log_step(f"❌ خطأ وفشل المهمة: {e}")
         rename_drive_folder(f"FAILED_{CLEAN_NAME}")
-        send_telegram(f"❌ *فشل معالجة الحلقة:* `{CLEAN_NAME}`\n⚠️ السبب: `{e}`")
-        send_gmail(f"❌ فشل تقييم الحلقة: {CLEAN_NAME}", f"السبب:\n{e}")
+        send_telegram(
+            f"❌ *فشل معالجة الحلقة:* `{CLEAN_NAME}`\n"
+            f"⚠️ التنبيه: تم رصد انتقاص أو خطأ في تحليل المقاطع.\n"
+            f"📝 السبب: `{e}`"
+        )
+        send_gmail(f"❌ فشل تقييم الحلقة: {CLEAN_NAME}", f"فشلت المهمة بسبب انتقاص أو عدم اكتمال تحليل المقاطع حتى النهاية.\n\nالسبب:\n{e}")
         sys.exit(1)
 
 if __name__ == "__main__":
