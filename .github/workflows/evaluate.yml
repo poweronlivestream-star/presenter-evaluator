@@ -41,4 +41,6 @@ jobs:
           NOTIFY_EMAIL: ${{ inputs.notify_email }}
           DRIVE_TOKEN: ${{ inputs.drive_token }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -u evaluate.py
