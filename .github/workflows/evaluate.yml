@@ -1,0 +1,44 @@
+name: Presenter Evaluation Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder_id:
+        description: 'Google Drive Folder ID'
+        required: true
+      clean_name:
+        description: 'Episode Clean Name'
+        required: true
+      log_file_id:
+        description: 'Live Log File ID on Drive'
+        required: true
+      notify_email:
+        description: 'Notification Email'
+        required: true
+      drive_token:
+        description: 'Temporary OAuth Token'
+        required: true
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Mask OAuth Token
+        run: echo "::add-mask::${{ inputs.drive_token }}"
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python & Dependencies
+        run: pip install requests
+
+      - name: Run FFmpeg & Gemini Evaluation
+        env:
+          FOLDER_ID: ${{ inputs.folder_id }}
+          CLEAN_NAME: ${{ inputs.clean_name }}
+          LOG_FILE_ID: ${{ inputs.log_file_id }}
+          NOTIFY_EMAIL: ${{ inputs.notify_email }}
+          DRIVE_TOKEN: ${{ inputs.drive_token }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+        run: python -u evaluate.py
