@@ -33,6 +33,12 @@ jobs:
       - name: Setup Python & Dependencies
         run: pip install requests
 
+      # 🛠️ الخطوة المضافة حديثاً لتثبيت FFmpeg و ffprobe على خادم السحابة
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       - name: Run FFmpeg & Gemini Evaluation
         env:
           FOLDER_ID: ${{ inputs.folder_id }}
