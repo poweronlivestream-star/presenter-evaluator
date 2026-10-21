@@ -193,17 +193,30 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
         ("gemini-3.8-flash",       0,     "gemini-3.8-flash (Standard Fast)",            False)
     ]
     
+    # حساب أزمنة البداية لكل جزء لمساعدة النموذج على إعطاء توقيت متصل دقيق 100%
+    audio_segs = sorted(glob.glob("Audio_part*.mp3"))
+    seg_timeline_info = []
+    accum_sec = 0.0
+    for idx, aseg in enumerate(audio_segs):
+        dur = get_duration_seconds(aseg)
+        start_str = format_hhmmss(accum_sec)
+        end_str = format_hhmmss(accum_sec + dur)
+        seg_timeline_info.append(f"- الجزء {idx:02d} ({aseg} / Visuals_part{idx:02d}.mp4): يبدأ من [{start_str}] وينتهي عند [{end_str}]")
+        accum_sec += dur
+    timeline_map_str = "\n".join(seg_timeline_info)
+
     system_prompt = (
         "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).\n"
         "قواعد إجبارية صارمة جداً:\n"
         "1. المنع المطلق للتخمين (Zero Hallucination): اعتمد حصرياً وبنسبة 100% على محتوى جميع ملفات الأجزاء المرفقة.\n"
-        f"2. التحقق الشامل من كامل المدة: المدة الفعلية للحلقة هي ({exact_duration}). تم تقسيم الحلقة إلى ({total_segments_count}) أجزاء صوتية ومرئية متسلسلة. يجب تغطية وتحليل جميع الأجزاء دون استثناء.\n"
-        "3. قاعدة التوقيت المطلق المتصل: في قائمة الشواهد والتوثيق الميداني، يجب أن تكون التوقيتات بتنسيق ساعة ودقيقة وثانية متصلة للفيديو الأصلي بالكامل (مثلاً 00:00:14 حتى نهاية الحلقة)، وممنوع نهائياً استخدام مصطلحات مثل (الجزء 1 أو الجزء 2).\n"
-        "4. فحص الاكتمال: إذا تبين أن أي جزء من الأجزاء لم يتم تحليله أو تم انتقاصه، اعتبر التحليل غير مكتمل.\n"
+        f"2. خريطة التوقيت المتصل للأجزاء (المدة الإجمالية {exact_duration}):\n{timeline_map_str}\n"
+        "3. قاعدة التوقيت المطلق المتصل: اجمع توقيت اللقطة داخل الجزء مع وقت بداية ذلك الجزء الموضح في الخريطة أعلاه، لتكون كافة التوقيتات في التقرير متصلة من بداية الحلقة (00:00:00) حتى نهايتها (" + exact_duration + "). ممنوع نهائياً كتابة (الجزء 1 أو الجزء 2).\n"
+        "4. التوثيق الحرفي لآخر كلام في الحلقة (lastSpokenWords): يجب عليك الاستماع إلى آخر دقيقة في آخر ملف صوتي مرفق، وتدوين النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل انتهاء الحلقة مباشرة مع توقيتها المتصل.\n"
         "5. أرجع كائن JSON حصراً بالحقول التالية:\n"
         "   - isFullDurationAnalyzed: (boolean)\n"
-        "   - analyzedAllSegments: (boolean) يجب أن يكون true حصراً إذا تم تحليل كافة الأجزاء.\n"
-        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل بالتوقيتات المتصلة حتى الخاتمة.\n"
+        "   - analyzedAllSegments: (boolean) يجب أن يكون true حصراً إذا تم تحليل كافة الأجزاء حتى الثانية الأخيرة.\n"
+        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل (مثال: '[00:54:30 - 00:54:54]: نشكر ضيفنا الكريم... إلى اللقاء في حلقة مقبلة').\n"
+        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل بالتوقيتات المتصلة.\n"
         "   - summarizedHtml: (string) التقرير المختصر."
     )
 
@@ -215,7 +228,7 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
             for seg in segments:
                 log_step(f"☁️ رفع الجزء ({seg}) إلى Gemini باستخدام Key #{key_idx}...")
                 uri, mime = upload_to_gemini_file_api(seg, api_key)
-                prompt_parts.append({"text": f"الملف المرفق التالي هو الجزء المتسلسل: {seg}"})
+                prompt_parts.append({"text": f"الملف المرفق التالي هو: {seg}"})
                 prompt_parts.append({"fileData": {"mimeType": mime, "fileUri": uri}})
         except Exception as up_err:
             errors.append(f"Key #{key_idx} Upload Error: {up_err}")
@@ -229,7 +242,7 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
             
             payload = {
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"role": "user", "parts": prompt_parts + [{"text": f"قم بتحليل وتقييم حلقة ({CLEAN_NAME}) بالكامل عبر تغطية جميع الأجزاء المرفقة بدقة تامة وصولاً للثواني الأخيرة."}]}],
+                "contents": [{"role": "user", "parts": prompt_parts + [{"text": f"قم بتحليل وتقييم حلقة ({CLEAN_NAME}) بالكامل عبر تغطية جميع الأجزاء المرفقة بدقة تامة وصولاً للثواني الأخيرة، واستخرج آخر كلام نُطق في ختام الحلقة حرفياً في حقل lastSpokenWords."}]}],
                 "generationConfig": gen_cfg
             }
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
@@ -244,6 +257,9 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
                     if not parsed.get("isFullDurationAnalyzed") or not parsed.get("analyzedAllSegments", True):
                         raise RuntimeError("أقر النموذج بعدم اكتمال تحليل كامل المقاطع والأجزاء.")
                     
+                    if not parsed.get("lastSpokenWords") or len(parsed.get("lastSpokenWords", "").strip()) < 10:
+                        raise RuntimeError("لم يتم استخراج النص الحرفي لآخر كلام في نهاية الحلقة.")
+
                     banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} (Key #{key_idx})</div>'
                     parsed["thinkingBanner"] = banner
                     return parsed
@@ -278,10 +294,7 @@ def main():
         upload_report_to_drive(f"01_Main_Detailed_Report_{CLEAN_NAME}.html", main_html)
         upload_report_to_drive(f"02_Summarized_Report_{CLEAN_NAME}.html", sum_html)
 
-        # استخلاص مقتطف من نهاية التحليل للتأكد من وصوله لآخر جزء
-        detailed_text = result.get("mainDetailedHtml", "")
-        snippet = detailed_text[-400:] if len(detailed_text) > 400 else detailed_text
-        clean_snippet = re.sub('<[^<]+?>', '', snippet).strip()
+        last_spoken = result.get("lastSpokenWords", "غير متوفر").strip()
 
         elapsed = int(time.time() - START_TIME)
         elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
@@ -293,15 +306,17 @@ def main():
             f"📌 الحلقة: `{CLEAN_NAME}`\n"
             f"📊 تم تحليل وتغطية كافة المقاطع ({total_segs_count} جزء) حتى النهاية.\n"
             f"⏱️ المدة الإجمالية: `{exact_duration}` | الوقت المستغرق: `{elapsed_str}`\n\n"
-            f"📝 *مقتطف من نهاية سكريبت الحلقة:*\n"
-            f"_{clean_snippet[:250]}..._\n\n"
+            f"🎙️ *آخر كلام نُطق في ختام الحلقة (Verbatim):*\n"
+            f"«_{last_spoken}_»\n\n"
             f"📁 [رابط المجلد على الدرايف]({folder_url})"
         )
         
         send_gmail(
             f"✅ اكتمل تقييم حلقة ({CLEAN_NAME}) بنجاح تام",
             f"تم الانتهاء من تحليل وتغطية كامل مقاطع الحلقة ({total_segs_count} جزء) بمدة ({exact_duration}) حتى الخاتمة دون أي نقص، وإصدار التقارير النهائية.\n\n"
-            f"• الوقت المستغرق: {elapsed_str}\n\n📁 رابط الدرايف:\n{folder_url}"
+            f"• الوقت المستغرق: {elapsed_str}\n"
+            f"• آخر كلام نُطق في ختام الحلقة:\n«{last_spoken}»\n\n"
+            f"📁 رابط الدرايف:\n{folder_url}"
         )
     except Exception as e:
         log_step(f"❌ خطأ وفشل المهمة: {e}")
