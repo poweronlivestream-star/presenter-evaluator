@@ -194,20 +194,33 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
         end_str = format_hhmmss(accum_sec + dur)
         seg_timeline_info.append(f"- الجزء {idx:02d} ({aseg} / Visuals_part{idx:02d}.mp4): يبدأ من [{start_str}] وينتهي عند [{end_str}]")
         accum_sec += dur
-    timeline_map_str = "\n".join(seg_timeline_info)
+    timeline_map_str = "
+".join(seg_timeline_info)
 
     system_prompt = (
-        "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).\n"
-        "قواعد إجبارية صارمة جداً:\n"
-        "1. المنع المطلق للتخمين (Zero Hallucination): اعتمد حصرياً وبنسبة 100% على محتوى جميع ملفات الأجزاء المرفقة.\n"
-        f"2. خريطة التوقيت المتصل للأجزاء (المدة الإجمالية {exact_duration}):\n{timeline_map_str}\n"
-        "3. قاعدة التوقيت المطلق المتصل: اجمع توقيت اللقطة داخل الجزء مع وقت بداية ذلك الجزء الموضح في الخريطة أعلاه، لتكون كافة التوقيتات في التقرير متصلة من بداية الحلقة (00:00:00) حتى نهايتها (" + exact_duration + "). ممنوع نهائياً كتابة (الجزء 1 أو الجزء 2).\n"
-        "4. التوثيق الحرفي لآخر كلام في الحلقة (lastSpokenWords): يجب عليك الاستماع إلى آخر دقيقة في آخر ملف صوتي مرفق، وتدوين النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل انتهاء الحلقة مباشرة مع توقيتها المتصل.\n"
-        "5. أرجع كائن JSON حصراً بالحقول التالية:\n"
-        "   - isFullDurationAnalyzed: (boolean)\n"
-        "   - analyzedAllSegments: (boolean) يجب أن يكون true حصراً إذا تم تحليل كافة الأجزاء حتى الثانية الأخيرة.\n"
-        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.\n"
-        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل بالتوقيتات المتصلة.\n"
+        "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).
+"
+        "قواعد إجبارية صارمة جداً:
+"
+        "1. المنع المطلق للتخمين (Zero Hallucination): اعتمد حصرياً وبنسبة 100% على محتوى جميع ملفات الأجزاء المرفقة.
+"
+        f"2. خريطة التوقيت المتصل للأجزاء (المدة الإجمالية {exact_duration}):
+{timeline_map_str}
+"
+        "3. قاعدة التوقيت المطلق المتصل: اجمع توقيت اللقطة داخل الجزء مع وقت بداية ذلك الجزء الموضح في الخريطة أعلاه، لتكون كافة التوقيتات في التقرير متصلة من بداية الحلقة (00:00:00) حتى نهايتها (" + exact_duration + "). ممنوع نهائياً كتابة (الجزء 1 أو الجزء 2).
+"
+        "4. التوثيق الحرفي لآخر كلام في الحلقة (lastSpokenWords): يجب عليك الاستماع إلى آخر دقيقة في آخر ملف صوتي مرفق، وتدوين النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل انتهاء الحلقة مباشرة مع توقيتها المتصل.
+"
+        "5. أرجع كائن JSON حصراً بالحقول التالية:
+"
+        "   - isFullDurationAnalyzed: (boolean)
+"
+        "   - analyzedAllSegments: (boolean) يجب أن يكون true حصراً إذا تم تحليل كافة الأجزاء حتى الثانية الأخيرة.
+"
+        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.
+"
+        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل بالتوقيتات المتصلة.
+"
         "   - summarizedHtml: (string) التقرير المختصر."
     )
 
@@ -238,7 +251,7 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
             }
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
             
-            for attempt in range(1, 4):
+            try:
                 res = requests.post(url, json=payload, timeout=600)
                 if res.status_code == 200:
                     data = res.json()
@@ -254,14 +267,18 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
                     banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} (Key #{key_idx})</div>'
                     parsed["thinkingBanner"] = banner
                     return parsed
-                elif res.status_code in (503, 429):
-                    log_step(f"⚠️ ضغط الخادم ({res.status_code}) على {label} - محاولة {attempt}/3...")
-                    time.sleep(8 * attempt)
                 else:
+                    log_step(f"⚠️ خطأ خادم ({res.status_code}) على {label} - انتقال فوري للنموذج التالي...")
                     errors.append(f"Key #{key_idx} [{label}] HTTP {res.status_code}: {res.text}")
-                    break
+                    continue
+            except Exception as req_err:
+                log_step(f"⚠️ خطأ اتصال/مهلة على {label}: {req_err} - انتقال فوري للنموذج التالي...")
+                errors.append(f"Key #{key_idx} [{label}] Error: {req_err}")
+                continue
 
-    raise RuntimeError("فشلت جميع المفاتيح والنماذج أو لم يتم تغطية كافة الأجزاء:\n" + "\n".join(errors))
+    raise RuntimeError("فشلت جميع المفاتيح والنماذج أو لم يتم تغطية كافة الأجزاء:
+" + "
+".join(errors))
 
 def main():
     try:
