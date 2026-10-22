@@ -24,9 +24,9 @@ API_KEYS = [
 START_TIME = time.time()
 LOG_LINES = []
 
-# إعداد جلسة اتصال قوية مع إعادة المحاولة التلقائية لتفادي انقطاع الشبكة
+# جلسة اتصال فولاذية بـ 10 محاولات كحد أقصى لانقطاعات الشبكة
 session = requests.Session()
-retries = Retry(total=5, backoff_factor=2, status_forcelist=[500, 502, 503, 504], raise_on_status=False)
+retries = Retry(total=10, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504], raise_on_status=False)
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 def send_telegram(message):
@@ -36,10 +36,13 @@ def send_telegram(message):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
+            "text": message[:4000],
             "parse_mode": "Markdown"
         }
-        session.post(url, json=payload, timeout=10)
+        res = session.post(url, json=payload, timeout=15)
+        if res.status_code != 200:
+            payload.pop("parse_mode")
+            session.post(url, json=payload, timeout=15)
     except Exception as e:
         print(f"خطأ في إرسال تليغرام: {e}", flush=True)
 
@@ -48,11 +51,11 @@ def log_step(msg):
     line = f"[{timestamp}] {msg}"
     print(line, flush=True)
     LOG_LINES.append(line)
-    send_telegram(f"🔔 *تحديث معالجة:* `{CLEAN_NAME}`\n_{msg}_")
+    send_telegram(f"🔔 *تحديث معالجة:* `{CLEAN_NAME}`\n_{msg[:300]}_")
     
     try:
         headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "text/plain; charset=utf-8"}
-        session.patch(f"https://www.googleapis.com/upload/drive/v3/files/{LOG_FILE_ID}?uploadType=media", headers=headers, data="\n".join(LOG_LINES).encode("utf-8"), timeout=15)
+        session.patch(f"https://www.googleapis.com/upload/drive/v3/files/{LOG_FILE_ID}?uploadType=media", headers=headers, data="\n".join(LOG_LINES).encode("utf-8"), timeout=20)
     except Exception as e:
         print(f"تحذير تحديث اللوغ: {e}", flush=True)
 
@@ -61,7 +64,7 @@ def update_drive_folder(new_name, description_text=""):
     payload = {"name": new_name}
     if description_text:
         payload["description"] = description_text
-    session.patch(f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}", headers=headers, json=payload, timeout=15)
+    session.patch(f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}", headers=headers, json=payload, timeout=20)
 
 def upload_report_to_drive(filename, html_content):
     metadata = {"name": filename, "parents": [FOLDER_ID], "mimeType": "text/html"}
@@ -76,12 +79,12 @@ def upload_report_to_drive(filename, html_content):
         f"--{boundary}--"
     ).encode("utf-8")
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"multipart/related; boundary={boundary}"}
-    session.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", headers=headers, data=body, timeout=30)
+    session.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", headers=headers, data=body, timeout=40)
 
 def list_drive_media_files():
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
     q = f"'{FOLDER_ID}' in parents and trashed = false"
-    res = session.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q, "fields": "files(id, name, mimeType, size)"}, timeout=20)
+    res = session.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q, "fields": "files(id, name, mimeType, size)"}, timeout=30)
     res.raise_for_status()
     files = res.json().get("files", [])
     media = [f for f in files if f["mimeType"].startswith("video/") or f["mimeType"].startswith("audio/")]
@@ -137,8 +140,15 @@ def prepare_media_segments(drive_files):
         return local_files, exact_duration
 
 def upload_to_gemini_file_api(filepath, api_key):
+    """
+    نسخة احترافية فولاذية (Stable Max) لرفع الملفات إلى Gemini API
+    تقوم برفع الملف على شكل حزم (Chunks) صغيرة (8MB) لتجنب انقطاع الاتصال المفاجئ
+    مع قدرة على استئناف الرفع (Resumable) إذا انقطع الاتصال في المنتصف.
+    """
     mime = "audio/mp3" if filepath.endswith(".mp3") else "video/mp4"
     filesize = os.path.getsize(filepath)
+    
+    # 1. بدء جلسة الرفع (Start Session)
     init_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}"
     init_headers = {
         "X-Goog-Upload-Protocol": "resumable",
@@ -151,18 +161,37 @@ def upload_to_gemini_file_api(filepath, api_key):
     r.raise_for_status()
     upload_url = r.headers["X-Goog-Upload-URL"]
 
+    # 2. رفع الملف على شكل حزم (Chunked Upload) لمنع الـ Connection Aborted
+    chunk_size = 8 * 1024 * 1024  # 8MB لكل حزمة
+    offset = 0
+    
     with open(filepath, "rb") as f:
-        up_res = session.post(upload_url, headers={"X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"}, data=f, timeout=300)
-    up_res.raise_for_status()
+        while offset < filesize:
+            chunk = f.read(chunk_size)
+            is_final = (offset + len(chunk) >= filesize)
+            command = "upload, finalize" if is_final else "upload"
+            
+            chunk_headers = {
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": command,
+                "X-Goog-Upload-Offset": str(offset),
+                "Content-Length": str(len(chunk))
+            }
+            
+            up_res = session.post(upload_url, headers=chunk_headers, data=chunk, timeout=120)
+            up_res.raise_for_status()
+            offset += len(chunk)
+
     file_info = up_res.json()["file"]
 
+    # 3. التحقق من جاهزية الملف (Polling)
     for _ in range(60):
         if file_info.get("state") == "ACTIVE":
             return file_info["uri"], mime
         time.sleep(3)
         chk = session.get(f"{file_info['uri']}?key={api_key}", timeout=20).json()
         file_info["state"] = chk.get("state")
-    raise RuntimeError(f"لم يصبح الملف {filepath} في حالة ACTIVE.")
+    raise RuntimeError(f"لم يصبح الملف {filepath} في حالة ACTIVE بعد الرفع.")
 
 def wrap_html(title, body_content):
     return f"""<!DOCTYPE html>
@@ -270,7 +299,7 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
                 errors.append(f"Key #{key_idx} [{label}] Error: {req_err}")
                 continue
 
-    raise RuntimeError("فشلت جميع المفاتيح والنماذج أو لم يتم تغطية كافة الأجزاء:\n" + "\n".join(errors))
+    raise RuntimeError("استنفدت جميع المفاتيح والنماذج أو تم رفض الطلبات بسبب ضغط الخوادم:\n" + "\n".join(errors))
 
 def main():
     try:
@@ -319,11 +348,13 @@ def main():
         )
     except Exception as e:
         log_step(f"❌ خطأ وفشل المهمة: {e}")
-        update_drive_folder(f"FAILED_{CLEAN_NAME}", f"السبب: {e}")
+        error_msg = str(e)
+        update_drive_folder(f"FAILED_{CLEAN_NAME}", f"السبب:\n{error_msg[:1000]}")
         send_telegram(
             f"❌ *فشل معالجة الحلقة:* `{CLEAN_NAME}`\n"
-            f"⚠️ التنبيه: تم رصد انتقاص أو خطأ في تحليل المقاطع.\n"
-            f"📝 السبب: `{e}`"
+            f"⚠️ التنبيه: تم إيقاف المعالجة بسبب خطأ تقني أو استنفاد الحصة.\n"
+            f"📝 *تفاصيل الخطأ الدقيقة:*\n"
+            f"`{error_msg[-800:]}`"
         )
         sys.exit(1)
 
