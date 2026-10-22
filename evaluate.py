@@ -8,6 +8,7 @@ from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import html
 
 FOLDER_ID = os.environ["FOLDER_ID"]
 CLEAN_NAME = os.environ["CLEAN_NAME"]
@@ -24,12 +25,16 @@ API_KEYS = [
 START_TIME = time.time()
 LOG_LINES = []
 
-# جلسة اتصال فولاذية بـ 10 محاولات كحد أقصى لانقطاعات الشبكة
+# جلسة الرفع لـ Gemini (مخصصة للملفات الثقيلة مع إعادة محاولة)
 session = requests.Session()
 retries = Retry(total=10, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504], raise_on_status=False)
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 def send_telegram(message):
+    """
+    إرسال تيليغرام باستخدام تنسيق HTML بدلاً من Markdown
+    لضمان عدم انهيار الرسالة إذا احتوت على رموز برمجية أو أقواس غير مغلقة.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -37,12 +42,15 @@ def send_telegram(message):
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message[:4000],
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
         }
-        res = session.post(url, json=payload, timeout=15)
+        # استخدام requests عادي بدلاً من session لتفادي تداخل مهلات الرفع
+        res = requests.post(url, json=payload, timeout=15)
         if res.status_code != 200:
-            payload.pop("parse_mode")
-            session.post(url, json=payload, timeout=15)
+            print(f"Telegram Formatting Error: {res.text}. Retrying as plain text...", flush=True)
+            payload.pop("parse_mode", None)
+            requests.post(url, json=payload, timeout=15)
     except Exception as e:
         print(f"خطأ في إرسال تليغرام: {e}", flush=True)
 
@@ -51,7 +59,10 @@ def log_step(msg):
     line = f"[{timestamp}] {msg}"
     print(line, flush=True)
     LOG_LINES.append(line)
-    send_telegram(f"🔔 *تحديث معالجة:* `{CLEAN_NAME}`\n_{msg[:300]}_")
+    
+    # حماية النص من كسر الـ HTML
+    safe_msg = html.escape(msg[:300])
+    send_telegram(f"🔔 <b>تحديث معالجة:</b> <code>{CLEAN_NAME}</code>\n<i>{safe_msg}</i>")
     
     try:
         headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "text/plain; charset=utf-8"}
@@ -148,7 +159,6 @@ def upload_to_gemini_file_api(filepath, api_key):
     mime = "audio/mp3" if filepath.endswith(".mp3") else "video/mp4"
     filesize = os.path.getsize(filepath)
     
-    # 1. بدء جلسة الرفع (Start Session)
     init_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}"
     init_headers = {
         "X-Goog-Upload-Protocol": "resumable",
@@ -161,8 +171,7 @@ def upload_to_gemini_file_api(filepath, api_key):
     r.raise_for_status()
     upload_url = r.headers["X-Goog-Upload-URL"]
 
-    # 2. رفع الملف على شكل حزم (Chunked Upload) لمنع الـ Connection Aborted
-    chunk_size = 8 * 1024 * 1024  # 8MB لكل حزمة
+    chunk_size = 8 * 1024 * 1024
     offset = 0
     
     with open(filepath, "rb") as f:
@@ -184,7 +193,6 @@ def upload_to_gemini_file_api(filepath, api_key):
 
     file_info = up_res.json()["file"]
 
-    # 3. التحقق من جاهزية الملف (Polling)
     for _ in range(60):
         if file_info.get("state") == "ACTIVE":
             return file_info["uri"], mime
@@ -248,115 +256,4 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
     )
 
     errors = []
-    for key_idx, api_key in enumerate(API_KEYS, start=1):
-        log_step(f"🔑 فحص المفتاح Key #{key_idx}...")
-        try:
-            prompt_parts = []
-            for seg in segments:
-                log_step(f"☁️ رفع الجزء ({seg}) إلى Gemini باستخدام Key #{key_idx}...")
-                uri, mime = upload_to_gemini_file_api(seg, api_key)
-                prompt_parts.append({"text": f"الملف المرفق التالي هو: {seg}"})
-                prompt_parts.append({"fileData": {"mimeType": mime, "fileUri": uri}})
-        except Exception as up_err:
-            errors.append(f"Key #{key_idx} Upload Error: {up_err}")
-            continue
-
-        for model_name, budget, label, is_highest in models:
-            log_step(f"🧠 بدء التحليل العميق لجميع الأجزاء عبر النموذج: {label} (Key #{key_idx})...")
-            gen_cfg = {"temperature": 0.0, "responseMimeType": "application/json"}
-            if budget > 0:
-                gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
-            
-            payload = {
-                "systemInstruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"role": "user", "parts": prompt_parts + [{"text": f"قم بتحليل وتقييم حلقة ({CLEAN_NAME}) بالكامل عبر تغطية جميع الأجزاء المرفقة بدقة تامة وصولاً للثواني الأخيرة، واستخرج آخر كلام نُطق في ختام الحلقة حرفياً في حقل lastSpokenWords."}]}],
-                "generationConfig": gen_cfg
-            }
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-            
-            try:
-                res = session.post(url, json=payload, timeout=600)
-                if res.status_code == 200:
-                    data = res.json()
-                    text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    parsed = json.loads(text)
-                    
-                    if not parsed.get("isFullDurationAnalyzed") or not parsed.get("analyzedAllSegments", True):
-                        raise RuntimeError("أقر النموذج بعدم اكتمال تحليل كامل المقاطع والأجزاء.")
-                    
-                    if not parsed.get("lastSpokenWords") or len(parsed.get("lastSpokenWords", "").strip()) < 10:
-                        raise RuntimeError("لم يتم استخراج النص الحرفي لآخر كلام في نهاية الحلقة.")
-
-                    banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} (Key #{key_idx})</div>'
-                    parsed["thinkingBanner"] = banner
-                    return parsed
-                else:
-                    log_step(f"⚠️ خطأ خادم ({res.status_code}) على {label} - انتقال فوري للنموذج التالي...")
-                    errors.append(f"Key #{key_idx} [{label}] HTTP {res.status_code}: {res.text}")
-                    continue
-            except Exception as req_err:
-                log_step(f"⚠️ خطأ اتصال/مهلة على {label}: {req_err} - انتقال فوري للنموذج التالي...")
-                errors.append(f"Key #{key_idx} [{label}] Error: {req_err}")
-                continue
-
-    raise RuntimeError("استنفدت جميع المفاتيح والنماذج أو تم رفض الطلبات بسبب ضغط الخوادم:\n" + "\n".join(errors))
-
-def main():
-    try:
-        send_telegram(f"🚀 *بدء معالجة حلقة:* `{CLEAN_NAME}`")
-        log_step(f"انطلاق معالجة الحلقة: {CLEAN_NAME}")
-        
-        drive_files = list_drive_media_files()
-        if not drive_files:
-            raise RuntimeError("المجلد لا يحتوي على أي ملفات فيديو أو صوت.")
-
-        segments, exact_duration = prepare_media_segments(drive_files)
-        total_segs_count = len(glob.glob("Audio_part*.mp3")) + len(glob.glob("Visuals_part*.mp4"))
-        
-        result = evaluate_with_gemini(segments, exact_duration, total_segs_count)
-
-        log_step(f"✅ تم بنجاح تحليل وتغطية كامل مقاطع الحلقة ({total_segs_count} جزء) حتى النهاية بمدة إجمالية ({exact_duration}) دون أي نقص!")
-        
-        main_html = wrap_html(f"تقييم تفصيلي - {CLEAN_NAME}", result["thinkingBanner"] + result["mainDetailedHtml"])
-        sum_html = wrap_html(f"تقرير مختصر - {CLEAN_NAME}", result["thinkingBanner"] + result["summarizedHtml"])
-
-        upload_report_to_drive(f"01_Main_Detailed_Report_{CLEAN_NAME}.html", main_html)
-        upload_report_to_drive(f"02_Summarized_Report_{CLEAN_NAME}.html", sum_html)
-
-        last_spoken = result.get("lastSpokenWords", "غير متوفر").strip()
-
-        elapsed = int(time.time() - START_TIME)
-        elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
-        
-        summary_desc = (
-            f"• عدد المقاطع المحللة: {total_segs_count} جزء\n"
-            f"• المدة الإجمالية للحلقة: {exact_duration}\n"
-            f"• الوقت المستغرق: {elapsed_str}\n"
-            f"• آخر كلام نُطق في ختام الحلقة (Verbatim):\n«{last_spoken}»"
-        )
-        update_drive_folder(f"PROCESSED_{CLEAN_NAME}", summary_desc)
-
-        folder_url = f"https://drive.google.com/drive/folders/{FOLDER_ID}"
-        send_telegram(
-            f"✅ *تمت المعالجة والتقييم بنجاح تام وتم التأكد من الوصول للجزء الأخير!*\n"
-            f"📌 الحلقة: `{CLEAN_NAME}`\n"
-            f"📊 تم تحليل وتغطية كافة المقاطع ({total_segs_count} جزء) حتى النهاية.\n"
-            f"⏱️ المدة الإجمالية: `{exact_duration}` | الوقت المستغرق: `{elapsed_str}`\n\n"
-            f"🎙️ *آخر كلام نُطق في ختام الحلقة (Verbatim):*\n"
-            f"«_{last_spoken}_»\n\n"
-            f"📁 [رابط المجلد على الدرايف]({folder_url})"
-        )
-    except Exception as e:
-        log_step(f"❌ خطأ وفشل المهمة: {e}")
-        error_msg = str(e)
-        update_drive_folder(f"FAILED_{CLEAN_NAME}", f"السبب:\n{error_msg[:1000]}")
-        send_telegram(
-            f"❌ *فشل معالجة الحلقة:* `{CLEAN_NAME}`\n"
-            f"⚠️ التنبيه: تم إيقاف المعالجة بسبب خطأ تقني أو استنفاد الحصة.\n"
-            f"📝 *تفاصيل الخطأ الدقيقة:*\n"
-            f"`{error_msg[-800:]}`"
-        )
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
+    for key_idx, api_
