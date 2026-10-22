@@ -6,6 +6,8 @@ import glob
 import subprocess
 from datetime import datetime
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 FOLDER_ID = os.environ["FOLDER_ID"]
 CLEAN_NAME = os.environ["CLEAN_NAME"]
@@ -22,6 +24,11 @@ API_KEYS = [
 START_TIME = time.time()
 LOG_LINES = []
 
+# إعداد جلسة اتصال قوية مع إعادة المحاولة التلقائية لتفادي انقطاع الشبكة
+session = requests.Session()
+retries = Retry(total=5, backoff_factor=2, status_forcelist=[500, 502, 503, 504], raise_on_status=False)
+session.mount('https://', HTTPAdapter(max_retries=retries))
+
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -32,7 +39,7 @@ def send_telegram(message):
             "text": message,
             "parse_mode": "Markdown"
         }
-        requests.post(url, json=payload, timeout=10)
+        session.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"خطأ في إرسال تليغرام: {e}", flush=True)
 
@@ -45,7 +52,7 @@ def log_step(msg):
     
     try:
         headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "text/plain; charset=utf-8"}
-        requests.patch(f"https://www.googleapis.com/upload/drive/v3/files/{LOG_FILE_ID}?uploadType=media", headers=headers, data="\n".join(LOG_LINES).encode("utf-8"), timeout=15)
+        session.patch(f"https://www.googleapis.com/upload/drive/v3/files/{LOG_FILE_ID}?uploadType=media", headers=headers, data="\n".join(LOG_LINES).encode("utf-8"), timeout=15)
     except Exception as e:
         print(f"تحذير تحديث اللوغ: {e}", flush=True)
 
@@ -54,7 +61,7 @@ def update_drive_folder(new_name, description_text=""):
     payload = {"name": new_name}
     if description_text:
         payload["description"] = description_text
-    requests.patch(f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}", headers=headers, json=payload, timeout=15)
+    session.patch(f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}", headers=headers, json=payload, timeout=15)
 
 def upload_report_to_drive(filename, html_content):
     metadata = {"name": filename, "parents": [FOLDER_ID], "mimeType": "text/html"}
@@ -69,12 +76,12 @@ def upload_report_to_drive(filename, html_content):
         f"--{boundary}--"
     ).encode("utf-8")
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"multipart/related; boundary={boundary}"}
-    requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", headers=headers, data=body, timeout=30)
+    session.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", headers=headers, data=body, timeout=30)
 
 def list_drive_media_files():
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
     q = f"'{FOLDER_ID}' in parents and trashed = false"
-    res = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q, "fields": "files(id, name, mimeType, size)"}, timeout=20)
+    res = session.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q, "fields": "files(id, name, mimeType, size)"}, timeout=20)
     res.raise_for_status()
     files = res.json().get("files", [])
     media = [f for f in files if f["mimeType"].startswith("video/") or f["mimeType"].startswith("audio/")]
@@ -83,7 +90,7 @@ def list_drive_media_files():
 
 def download_drive_file(file_id, local_path):
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
-    with requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, stream=True, timeout=120) as r:
+    with session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(local_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
@@ -140,12 +147,12 @@ def upload_to_gemini_file_api(filepath, api_key):
         "X-Goog-Upload-Header-Content-Type": mime,
         "Content-Type": "application/json"
     }
-    r = requests.post(init_url, headers=init_headers, json={"file": {"display_name": filepath}}, timeout=30)
+    r = session.post(init_url, headers=init_headers, json={"file": {"display_name": filepath}}, timeout=30)
     r.raise_for_status()
     upload_url = r.headers["X-Goog-Upload-URL"]
 
     with open(filepath, "rb") as f:
-        up_res = requests.post(upload_url, headers={"X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"}, data=f, timeout=300)
+        up_res = session.post(upload_url, headers={"X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"}, data=f, timeout=300)
     up_res.raise_for_status()
     file_info = up_res.json()["file"]
 
@@ -153,7 +160,7 @@ def upload_to_gemini_file_api(filepath, api_key):
         if file_info.get("state") == "ACTIVE":
             return file_info["uri"], mime
         time.sleep(3)
-        chk = requests.get(f"{file_info['uri']}?key={api_key}", timeout=20).json()
+        chk = session.get(f"{file_info['uri']}?key={api_key}", timeout=20).json()
         file_info["state"] = chk.get("state")
     raise RuntimeError(f"لم يصبح الملف {filepath} في حالة ACTIVE.")
 
@@ -194,33 +201,20 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
         end_str = format_hhmmss(accum_sec + dur)
         seg_timeline_info.append(f"- الجزء {idx:02d} ({aseg} / Visuals_part{idx:02d}.mp4): يبدأ من [{start_str}] وينتهي عند [{end_str}]")
         accum_sec += dur
-    timeline_map_str = "
-".join(seg_timeline_info)
+    timeline_map_str = "\n".join(seg_timeline_info)
 
     system_prompt = (
-        "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).
-"
-        "قواعد إجبارية صارمة جداً:
-"
-        "1. المنع المطلق للتخمين (Zero Hallucination): اعتمد حصرياً وبنسبة 100% على محتوى جميع ملفات الأجزاء المرفقة.
-"
-        f"2. خريطة التوقيت المتصل للأجزاء (المدة الإجمالية {exact_duration}):
-{timeline_map_str}
-"
-        "3. قاعدة التوقيت المطلق المتصل: اجمع توقيت اللقطة داخل الجزء مع وقت بداية ذلك الجزء الموضح في الخريطة أعلاه، لتكون كافة التوقيتات في التقرير متصلة من بداية الحلقة (00:00:00) حتى نهايتها (" + exact_duration + "). ممنوع نهائياً كتابة (الجزء 1 أو الجزء 2).
-"
-        "4. التوثيق الحرفي لآخر كلام في الحلقة (lastSpokenWords): يجب عليك الاستماع إلى آخر دقيقة في آخر ملف صوتي مرفق، وتدوين النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل انتهاء الحلقة مباشرة مع توقيتها المتصل.
-"
-        "5. أرجع كائن JSON حصراً بالحقول التالية:
-"
-        "   - isFullDurationAnalyzed: (boolean)
-"
-        "   - analyzedAllSegments: (boolean) يجب أن يكون true حصراً إذا تم تحليل كافة الأجزاء حتى الثانية الأخيرة.
-"
-        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.
-"
-        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل بالتوقيتات المتصلة.
-"
+        "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).\n"
+        "قواعد إجبارية صارمة جداً:\n"
+        "1. المنع المطلق للتخمين (Zero Hallucination): اعتمد حصرياً وبنسبة 100% على محتوى جميع ملفات الأجزاء المرفقة.\n"
+        f"2. خريطة التوقيت المتصل للأجزاء (المدة الإجمالية {exact_duration}):\n{timeline_map_str}\n"
+        "3. قاعدة التوقيت المطلق المتصل: اجمع توقيت اللقطة داخل الجزء مع وقت بداية ذلك الجزء الموضح في الخريطة أعلاه، لتكون كافة التوقيتات في التقرير متصلة من بداية الحلقة (00:00:00) حتى نهايتها (" + exact_duration + "). ممنوع نهائياً كتابة (الجزء 1 أو الجزء 2).\n"
+        "4. التوثيق الحرفي لآخر كلام في الحلقة (lastSpokenWords): يجب عليك الاستماع إلى آخر دقيقة في آخر ملف صوتي مرفق، وتدوين النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل انتهاء الحلقة مباشرة مع توقيتها المتصل.\n"
+        "5. أرجع كائن JSON حصراً بالحقول التالية:\n"
+        "   - isFullDurationAnalyzed: (boolean)\n"
+        "   - analyzedAllSegments: (boolean) يجب أن يكون true حصراً إذا تم تحليل كافة الأجزاء حتى الثانية الأخيرة.\n"
+        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.\n"
+        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل بالتوقيتات المتصلة.\n"
         "   - summarizedHtml: (string) التقرير المختصر."
     )
 
@@ -252,7 +246,7 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
             
             try:
-                res = requests.post(url, json=payload, timeout=600)
+                res = session.post(url, json=payload, timeout=600)
                 if res.status_code == 200:
                     data = res.json()
                     text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -276,9 +270,7 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
                 errors.append(f"Key #{key_idx} [{label}] Error: {req_err}")
                 continue
 
-    raise RuntimeError("فشلت جميع المفاتيح والنماذج أو لم يتم تغطية كافة الأجزاء:
-" + "
-".join(errors))
+    raise RuntimeError("فشلت جميع المفاتيح والنماذج أو لم يتم تغطية كافة الأجزاء:\n" + "\n".join(errors))
 
 def main():
     try:
