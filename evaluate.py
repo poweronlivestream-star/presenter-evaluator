@@ -256,4 +256,118 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
     )
 
     errors = []
-    for key_idx, api_
+    for key_idx, api_key in enumerate(API_KEYS, start=1):
+        log_step(f"🔑 فحص المفتاح Key #{key_idx}...")
+        try:
+            prompt_parts = []
+            for seg in segments:
+                log_step(f"☁️ رفع الجزء ({seg}) إلى Gemini باستخدام Key #{key_idx}...")
+                uri, mime = upload_to_gemini_file_api(seg, api_key)
+                prompt_parts.append({"text": f"الملف المرفق التالي هو: {seg}"})
+                prompt_parts.append({"fileData": {"mimeType": mime, "fileUri": uri}})
+        except Exception as up_err:
+            errors.append(f"Key #{key_idx} Upload Error: {up_err}")
+            continue
+
+        for model_name, budget, label, is_highest in models:
+            log_step(f"🧠 بدء التحليل العميق لجميع الأجزاء عبر النموذج: {label} (Key #{key_idx})...")
+            gen_cfg = {"temperature": 0.0, "responseMimeType": "application/json"}
+            if budget > 0:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
+            
+            payload = {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"role": "user", "parts": prompt_parts + [{"text": f"قم بتحليل وتقييم حلقة ({CLEAN_NAME}) بالكامل عبر تغطية جميع الأجزاء المرفقة بدقة تامة وصولاً للثواني الأخيرة، واستخرج آخر كلام نُطق في ختام الحلقة حرفياً في حقل lastSpokenWords."}]}],
+                "generationConfig": gen_cfg
+            }
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            
+            try:
+                res = session.post(url, json=payload, timeout=600)
+                if res.status_code == 200:
+                    data = res.json()
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    parsed = json.loads(text)
+                    
+                    if not parsed.get("isFullDurationAnalyzed") or not parsed.get("analyzedAllSegments", True):
+                        raise RuntimeError("أقر النموذج بعدم اكتمال تحليل كامل المقاطع والأجزاء.")
+                    
+                    if not parsed.get("lastSpokenWords") or len(parsed.get("lastSpokenWords", "").strip()) < 10:
+                        raise RuntimeError("لم يتم استخراج النص الحرفي لآخر كلام في نهاية الحلقة.")
+
+                    banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} (Key #{key_idx})</div>'
+                    parsed["thinkingBanner"] = banner
+                    return parsed
+                else:
+                    log_step(f"⚠️ خطأ خادم ({res.status_code}) على {label} - انتقال فوري للنموذج التالي...")
+                    errors.append(f"Key #{key_idx} [{label}] HTTP {res.status_code}: {res.text}")
+                    continue
+            except Exception as req_err:
+                log_step(f"⚠️ خطأ اتصال/مهلة على {label}: {req_err} - انتقال فوري للنموذج التالي...")
+                errors.append(f"Key #{key_idx} [{label}] Error: {req_err}")
+                continue
+
+    raise RuntimeError("استنفدت جميع المفاتيح والنماذج أو تم رفض الطلبات بسبب ضغط الخوادم:\n" + "\n".join(errors))
+
+def main():
+    try:
+        send_telegram(f"🚀 <b>بدء معالجة حلقة:</b> <code>{CLEAN_NAME}</code>")
+        log_step(f"انطلاق معالجة الحلقة: {CLEAN_NAME}")
+        
+        drive_files = list_drive_media_files()
+        if not drive_files:
+            raise RuntimeError("المجلد لا يحتوي على أي ملفات فيديو أو صوت.")
+
+        segments, exact_duration = prepare_media_segments(drive_files)
+        total_segs_count = len(glob.glob("Audio_part*.mp3")) + len(glob.glob("Visuals_part*.mp4"))
+        
+        result = evaluate_with_gemini(segments, exact_duration, total_segs_count)
+
+        log_step(f"✅ تم بنجاح تحليل وتغطية كامل مقاطع الحلقة ({total_segs_count} جزء) حتى النهاية بمدة إجمالية ({exact_duration}) دون أي نقص!")
+        
+        main_html = wrap_html(f"تقييم تفصيلي - {CLEAN_NAME}", result["thinkingBanner"] + result["mainDetailedHtml"])
+        sum_html = wrap_html(f"تقرير مختصر - {CLEAN_NAME}", result["thinkingBanner"] + result["summarizedHtml"])
+
+        upload_report_to_drive(f"01_Main_Detailed_Report_{CLEAN_NAME}.html", main_html)
+        upload_report_to_drive(f"02_Summarized_Report_{CLEAN_NAME}.html", sum_html)
+
+        last_spoken = result.get("lastSpokenWords", "غير متوفر").strip()
+
+        elapsed = int(time.time() - START_TIME)
+        elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
+        
+        summary_desc = (
+            f"• عدد المقاطع المحللة: {total_segs_count} جزء\n"
+            f"• المدة الإجمالية للحلقة: {exact_duration}\n"
+            f"• الوقت المستغرق: {elapsed_str}\n"
+            f"• آخر كلام نُطق في ختام الحلقة (Verbatim):\n«{last_spoken}»"
+        )
+        update_drive_folder(f"PROCESSED_{CLEAN_NAME}", summary_desc)
+
+        folder_url = f"https://drive.google.com/drive/folders/{FOLDER_ID}"
+        send_telegram(
+            f"✅ <b>تمت المعالجة والتقييم بنجاح تام وتم التأكد من الوصول للجزء الأخير!</b>\n"
+            f"📌 الحلقة: <code>{html.escape(CLEAN_NAME)}</code>\n"
+            f"📊 تم تحليل وتغطية كافة المقاطع ({total_segs_count} جزء) حتى النهاية.\n"
+            f"⏱️ المدة الإجمالية: <code>{exact_duration}</code> | الوقت المستغرق: <code>{elapsed_str}</code>\n\n"
+            f"🎙️ <b>آخر كلام نُطق في ختام الحلقة (Verbatim):</b>\n"
+            f"«<i>{html.escape(last_spoken)}</i>»\n\n"
+            f"📁 <a href='{folder_url}'>رابط المجلد على الدرايف</a>"
+        )
+    except Exception as e:
+        log_step(f"❌ خطأ وفشل المهمة: {e}")
+        error_msg = str(e)
+        update_drive_folder(f"FAILED_{CLEAN_NAME}", f"السبب:\n{error_msg[:1000]}")
+        
+        # حماية النص من كسر تنسيق تيليغرام
+        safe_error = html.escape(error_msg[-800:])
+        send_telegram(
+            f"❌ <b>فشل معالجة الحلقة:</b> <code>{html.escape(CLEAN_NAME)}</code>\n"
+            f"⚠️ التنبيه: تم إيقاف المعالجة بسبب خطأ تقني أو استنفاد الحصة.\n"
+            f"📝 <b>تفاصيل الخطأ الدقيقة:</b>\n"
+            f"<pre>{safe_error}</pre>"
+        )
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
