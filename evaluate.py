@@ -138,10 +138,11 @@ def prepare_media_segments(drive_files):
         if IS_LOW_MODE:
             log_step("✂️ تطبيق إعدادات المجاني: (يتم أخذ صورة واحدة كل خمس ثوان - دقة متدنية) + استخراج الصوت...")
             subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", "48k", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Audio_part%02d.mp3"], check=True)
-            subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "32", "-maxrate", "100k", "-bufsize", "200k", "-vf", "scale=-2:480,fps=0.2", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
+            subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "32", "-g", "5", "-maxrate", "100k", "-bufsize", "200k", "-vf", "scale=-2:480,fps=0.2", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
         else:
-            log_step("✂️ تطبيق إعدادات المنظومة الاحترافية: استخراج الصوت (64k) والصورة بدقة صورة كل ثانية (720p)...")
+            log_step("✂️ جاري تشغيل FFmpeg لاستخراج وتقسيم الصوت (MP3) كل 25 دقيقة...")
             subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", "64k", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Audio_part%02d.mp3"], check=True)
+            log_step("🎞️ جاري تشغيل FFmpeg لاستخراج وتقسيم الصورة (فيديو خفيف 720p - 1fps) كل 25 دقيقة...")
             subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "30", "-maxrate", "150k", "-bufsize", "300k", "-vf", "scale=-2:720,fps=1", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
         
         segments = sorted(glob.glob("Audio_part*.mp3")) + sorted(glob.glob("Visuals_part*.mp4"))
@@ -204,21 +205,16 @@ def upload_to_gemini_file_api(filepath, api_key):
         file_info["state"] = chk.get("state")
     raise RuntimeError(f"لم يصبح الملف {filepath} في حالة ACTIVE بعد الرفع.")
 
-def evaluate_with_gemini(segments, exact_duration, total_segments_count):
-    if IS_LOW_MODE:
-        models = [
-            ("gemini-3.8-flash", 8192, "gemini-3.8-flash (Thinking 8192 - Free Tier)", True),
-            ("gemini-3.8-flash", 0,    "gemini-3.8-flash (Standard Fast - Free Tier)", False)
-        ]
-        max_attempts_per_model = 2
-    else:
-        models = [
-            ("gemini-3.1-pro-preview", 24576, "gemini-3.1-pro-preview (Max Thinking 24576)", True),
-            ("gemini-3.1-pro-preview", 8192,  "gemini-3.1-pro-preview (Med Thinking 8192)",  False),
-            ("gemini-3.8-flash",       24576, "gemini-3.8-flash (High Thinking 24576)",      False),
-            ("gemini-3.8-flash",       0,     "gemini-3.8-flash (Standard Fast)",            False)
-        ]
-        max_attempts_per_model = 1
+# ==============================================================================
+# المسار الأول: النسخة الأساسية الاحترافية (كما كانت تماماً - ترفع وتحلل دفعة واحدة)
+# ==============================================================================
+def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
+    models = [
+        ("gemini-3.1-pro-preview", 24576, "gemini-3.1-pro-preview (Max Thinking 24576)", True),
+        ("gemini-3.1-pro-preview", 8192,  "gemini-3.1-pro-preview (Med Thinking 8192)",  False),
+        ("gemini-3.8-flash",       24576, "gemini-3.8-flash (High Thinking 24576)",      False),
+        ("gemini-3.8-flash",       0,     "gemini-3.8-flash (Standard Fast)",            False)
+    ]
     
     audio_segs = sorted(glob.glob("Audio_part*.mp3"))
     seg_timeline_info = []
@@ -227,7 +223,7 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
         dur = get_duration_seconds(aseg)
         start_str = format_hhmmss(accum_sec)
         end_str = format_hhmmss(accum_sec + dur)
-        seg_timeline_info.append(f"- الجزء {idx:02d} ({aseg} / Visuals_part{idx:02d}.mp4): [{start_str}] -> [{end_str}]")
+        seg_timeline_info.append(f"- الجزء {idx:02d} ({aseg}): [{start_str}] -> [{end_str}]")
         accum_sec += dur
     timeline_map_str = "\n".join(seg_timeline_info)
 
@@ -252,97 +248,248 @@ def evaluate_with_gemini(segments, exact_duration, total_segments_count):
         try:
             prompt_parts = []
             for seg in segments:
-                log_step(f"☁️ رفع الجزء ({seg}) باستخدام Key #{key_idx}...")
+                log_step(f"☁️ رفع الجزء ({seg}) إلى Gemini باستخدام Key #{key_idx}...")
                 uri, mime = upload_to_gemini_file_api(seg, api_key)
                 prompt_parts.append({"text": f"الملف المرفق التالي هو: {seg}"})
                 prompt_parts.append({"fileData": {"mimeType": mime, "fileUri": uri}})
-                if IS_LOW_MODE:
-                    time.sleep(2)
         except Exception as up_err:
             errors.append(f"• المفتاح #{key_idx}: فشل رفع الملفات ({str(up_err)[:60]})")
             continue
 
-        if IS_LOW_MODE:
-            log_step("⏳ انتظار 10 ثوانٍ قبل التحليل لموازنة حصة الدقيقة المجانية...")
-            time.sleep(10)
-
         for model_name, budget, label, is_highest in models:
-            for attempt in range(1, max_attempts_per_model + 1):
-                log_step(f"🧠 بدء التحليل عبر {label} (Key #{key_idx})...")
-                gen_cfg = {"temperature": 0.0, "responseMimeType": "application/json"}
+            log_step(f"🧠 بدء التحليل العميق لجميع الأجزاء عبر النموذج: {label} (Key #{key_idx})...")
+            gen_cfg = {"temperature": 0.0, "responseMimeType": "application/json"}
+            if budget > 0:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
+            
+            payload = {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"role": "user", "parts": prompt_parts + [{"text": f"قم بتحليل وتقييم حلقة ({CLEAN_NAME}) بالكامل."}]}],
+                "generationConfig": gen_cfg
+            }
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            
+            try:
+                res = session.post(url, json=payload, timeout=600)
+                if res.status_code == 200:
+                    data = res.json()
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    parsed = json.loads(text)
+                    banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} (Key #{key_idx})</div>'
+                    parsed["thinkingBanner"] = banner
+                    return parsed
+                elif res.status_code == 429:
+                    err_msg = res.json().get("error", {}).get("message", "")
+                    match = re.search(r'Please retry in ([a-zA-Z0-9.]+)', err_msg)
+                    wait_time = match.group(1).split('.')[0] if match else "مؤقت"
+                    clean_err = f"المفتاح مستنفد (يعمل بعد: {wait_time})"
+                    log_step(f"⚠️ {clean_err} - انتقال للنموذج/المفتاح التالي...")
+                    errors.append(f"• المفتاح #{key_idx} [{label}]: {clean_err}")
+                    continue
+                elif res.status_code == 503:
+                    log_step(f"⚠️ ضغط سيرفرات جوجل (503) على {label} - انتقال للنموذج/المفتاح التالي...")
+                    errors.append(f"• المفتاح #{key_idx} [{label}]: ضغط سيرفرات جوجل (503)")
+                    continue
+                else:
+                    errors.append(f"• المفتاح #{key_idx} [{label}]: HTTP {res.status_code}")
+                    continue
+            except Exception as req_err:
+                log_step(f"⚠️ خطأ اتصال على {label} - انتقال للنموذج التالي...")
+                errors.append(f"• المفتاح #{key_idx} [{label}]: خطأ شبكة ({str(req_err)[:50]})")
+                continue
+
+    raise RuntimeError("\n".join(errors))
+
+# ==============================================================================
+# المسار الثاني: نسخة المجاني فقط (_LOW) - تحليل كل مقطع على حدة لتفادي 503 و 429
+# ==============================================================================
+def call_gemini_low_mode_step(system_prompt, user_parts_builder, models_list, step_Title, expect_json=True):
+    errors = []
+    for key_idx, api_key in enumerate(API_KEYS, start=1):
+        try:
+            prompt_parts = user_parts_builder(api_key, key_idx)
+        except Exception as up_err:
+            errors.append(f"• المفتاح #{key_idx} ({step_Title}): فشل رفع الملفات ({str(up_err)[:50]})")
+            continue
+
+        for model_name, budget, label, is_highest in models_list:
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                log_step(f"🧠 [{step_Title}] عبر {label} (Key #{key_idx} - محاولة {attempt}/{max_attempts})...")
+                gen_cfg = {"temperature": 0.0}
+                if expect_json:
+                    gen_cfg["responseMimeType"] = "application/json"
                 if budget > 0:
                     gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
-                
+
                 payload = {
                     "systemInstruction": {"parts": [{"text": system_prompt}]},
-                    "contents": [{"role": "user", "parts": prompt_parts + [{"text": f"قم بتحليل وتقييم حلقة ({CLEAN_NAME}) بالكامل عبر تغطية جميع الأجزاء المرفقة بدقة تامة وصولاً للثواني الأخيرة، واستخرج آخر كلام نُطق في ختام الحلقة حرفياً في حقل lastSpokenWords."}]}],
+                    "contents": [{"role": "user", "parts": prompt_parts}],
                     "generationConfig": gen_cfg
                 }
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-                
+
                 try:
                     res = session.post(url, json=payload, timeout=600)
                     if res.status_code == 200:
                         data = res.json()
                         text = data["candidates"][0]["content"]["parts"][0]["text"]
-                        parsed = json.loads(text)
-                        
-                        if not parsed.get("isFullDurationAnalyzed") or not parsed.get("analyzedAllSegments", True):
-                            raise RuntimeError("أقر النموذج بعدم اكتمال تحليل كامل المقاطع والأجزاء.")
-                        
-                        if not parsed.get("lastSpokenWords") or len(parsed.get("lastSpokenWords", "").strip()) < 10:
-                            raise RuntimeError("لم يتم استخراج النص الحرفي لآخر كلام في نهاية الحلقة.")
-
-                        banners = []
-                        if IS_LOW_MODE:
-                            banners.append(
-                                '<div class="low-mode-banner">'
-                                '⚠️ <b>تنبيه نوع المنظومة:</b> تم اختيار <b>المنظومة المجانية (_LOW) (يتم أخذ صورة واحدة كل خمس ثوان - دقة متدنية)</b> '
-                                'وهي منظومة اقتصادية أقل دقة مخصصة للباقة المجانية. '
-                                'للحصول على الدقة التحليلية القصوى (صورة كل ثانية)، يرجى تسمية المجلد بدون لاحقة <code>_LOW</code>.'
-                                '</div>'
-                            )
-                        if not is_highest or IS_LOW_MODE:
-                            banners.append(f'<div class="thinking-note">المنظومة: {MODE_TITLE} | النموذج: {label} (Key #{key_idx})</div>')
-                        
-                        parsed["thinkingBanner"] = "".join(banners)
-                        return parsed
+                        return text, label, key_idx
 
                     elif res.status_code == 429:
                         err_msg = res.json().get("error", {}).get("message", "")
                         match = re.search(r'Please retry in ([a-zA-Z0-9.]+)', err_msg)
                         wait_time = match.group(1).split('.')[0] if match else "مؤقت"
                         clean_err = f"الحصة مستنفدة 429 (يعمل بعد: {wait_time})"
-                        
-                        if IS_LOW_MODE and "h" not in wait_time and attempt < max_attempts_per_model:
-                            log_step(f"⏳ امتلاء عداد الدقيقة المجاني ({wait_time}). إبطاء العملية لمدة 65 ثانية ثم الإعادة...")
+
+                        if "h" not in wait_time and attempt < max_attempts:
+                            log_step(f"⏳ [{step_Title}] امتلاء عداد الدقيقة ({wait_time}). تهدئة 65 ثانية ثم الإعادة...")
                             time.sleep(65)
                             continue
-                            
-                        log_step(f"⚠️ {clean_err} - انتقال للنموذج/المفتاح التالي...")
+
+                        log_step(f"⚠️ [{step_Title}] {clean_err} - انتقال للنموذج/المفتاح التالي...")
                         errors.append(f"• المفتاح #{key_idx} [{label}]: {clean_err}")
                         break
 
                     elif res.status_code == 503:
-                        if IS_LOW_MODE and attempt < max_attempts_per_model:
-                            log_step(f"⏳ ضغط سيرفرات (503) على {label}. انتظار 65 ثانية ثم الإعادة...")
-                            time.sleep(65)
+                        if attempt < max_attempts:
+                            wait_sec = 45 * attempt
+                            log_step(f"⏳ [{step_Title}] ضغط سيرفرات جوجل (503) على {label}. انتظار {wait_sec} ثانية ثم الإعادة...")
+                            time.sleep(wait_sec)
                             continue
-                        log_step(f"⚠️ ضغط سيرفرات جوجل (503) على {label} - انتقال للنموذج/المفتاح التالي...")
+                        log_step(f"⚠️ [{step_Title}] استمرار ضغط السيرفرات (503) على {label} - انتقال للتالي...")
                         errors.append(f"• المفتاح #{key_idx} [{label}]: ضغط سيرفرات جوجل (503)")
                         break
                     else:
                         errors.append(f"• المفتاح #{key_idx} [{label}]: HTTP {res.status_code}")
                         break
                 except Exception as req_err:
-                    log_step(f"⚠️ خطأ اتصال على {label}: {str(req_err)[:60]}...")
-                    errors.append(f"• المفتاح #{key_idx} [{label}]: {str(req_err)[:60]}")
-                    if IS_LOW_MODE and attempt < max_attempts_per_model:
+                    log_step(f"⚠️ [{step_Title}] خطأ اتصال مؤقت: {str(req_err)[:50]}...")
+                    errors.append(f"• المفتاح #{key_idx} [{label}]: {str(req_err)[:50]}")
+                    if attempt < max_attempts:
                         time.sleep(30)
                         continue
                     break
 
     raise RuntimeError("\n".join(errors))
+
+def evaluate_low_free_mode(segments, exact_duration, total_segments_count):
+    models = [
+        ("gemini-3.8-flash", 0,    "gemini-3.8-flash (Standard Fast - Free Tier)", True),
+        ("gemini-3.8-flash", 8192, "gemini-3.8-flash (Thinking 8192 - Free Tier)", False)
+    ]
+
+    audio_segs = sorted(glob.glob("Audio_part*.mp3"))
+    visual_segs = sorted(glob.glob("Visuals_part*.mp4"))
+    num_parts = len(audio_segs)
+
+    part_configs = []
+    accum_sec = 0.0
+    for idx, aseg in enumerate(audio_segs):
+        dur = get_duration_seconds(aseg)
+        start_str = format_hhmmss(accum_sec)
+        end_str = format_hhmmss(accum_sec + dur)
+        vseg = visual_segs[idx] if idx < len(visual_segs) else None
+        part_configs.append({
+            "idx": idx,
+            "audio": aseg,
+            "visual": vseg,
+            "start_str": start_str,
+            "end_str": end_str
+        })
+        accum_sec += dur
+
+    part_summaries = []
+    used_label = ""
+    used_key_idx = 1
+
+    for p in part_configs:
+        idx = p["idx"]
+        is_last_part = (idx == num_parts - 1)
+        step_title = f"تحليل المقطع {idx + 1}/{num_parts} ({p['start_str']} -> {p['end_str']})"
+
+        part_sys_prompt = (
+            "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).\n"
+            f"أنت الآن تحلل المقطع رقم ({idx + 1} من {num_parts}) والذي يمتد في الحلقة الأصلية من التوقيت [{p['start_str']}] إلى [{p['end_str']}].\n"
+            "قواعد صارمة:\n"
+            f"1. قاعدة التوقيت المتصل: أضف دائماً وقت بداية هذا المقطع ({p['start_str']}) إلى أي توقيت ترصده داخل الملف، لتكون جميع التوقيتات المدونة بين [{p['start_str']}] و [{p['end_str']}].\n"
+            "2. استخرج تقريراً تحليلياً تفصيلياً وشاملاً لهذا المقطع يغطي كافة معايير سلم الـ 90 نقطة مع ذكر الشواهد والاقتباسات الحرفية بتوقيتاتها المتصلة.\n"
+            + ("3. هام جداً (المقطع الأخير): استمع بدقة إلى الدقيقة الأخيرة من هذا المقطع واكتب في نهاية تحليلك تحت عنوان [LAST_SPOKEN_WORDS] النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل ختام الحلقة مع توقيتها المتصل." if is_last_part else "")
+        )
+
+        def build_part_upload(api_key, key_idx, part_info=p):
+            files_to_up = [part_info["audio"]]
+            if part_info["visual"]:
+                files_to_up.append(part_info["visual"])
+            parts_list = []
+            for fpath in files_to_up:
+                log_step(f"☁️ رفع ({fpath}) للمقطع {part_info['idx'] + 1}/{num_parts} عبر Key #{key_idx}...")
+                uri, mime = upload_to_gemini_file_api(fpath, api_key)
+                parts_list.append({"text": f"الملف المرفق: {fpath}"})
+                parts_list.append({"fileData": {"mimeType": mime, "fileUri": uri}})
+            parts_list.append({
+                "text": f"حلل هذا المقطع الممتد من [{part_info['start_str']}] إلى [{part_info['end_str']}] بالتفصيل وبتوقيتات متصلة."
+            })
+            return parts_list
+
+        part_text, used_label, used_key_idx = call_gemini_low_mode_step(
+            system_prompt=part_sys_prompt,
+            user_parts_builder=build_part_upload,
+            models_list=models,
+            step_Title=step_title,
+            expect_json=False
+        )
+        part_summaries.append(f"=== تحليل المقطع {idx + 1} (من {p['start_str']} إلى {p['end_str']}) ===\n{part_text}")
+
+        if not is_last_part:
+            log_step("⏳ تهدئة 35 ثانية قبل المقطع التالي لإراحة عداد التوكنز المجاني...")
+            time.sleep(35)
+
+    log_step("📊 دمج تحليلات جميع المقاطع وإصدار التقرير النهائي الموحد (90 نقطة)...")
+    combined_notes = "\n\n".join(part_summaries)
+
+    final_sys_prompt = (
+        "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).\n"
+        f"أمامك التحليلات التفصيلية الكاملة لجميع مقاطع الحلقة ({CLEAN_NAME}) والبالغة مدتها الإجمالية ({exact_duration}).\n"
+        "قواعد إجبارية صارمة:\n"
+        "1. قم بدمج وتوحيد هذه التحليلات في تقييم نهائي واحد متكامل وشامل للحلقة كاملة من (00:00:00) حتى (" + exact_duration + ") وفق سلم الـ 90 نقطة.\n"
+        "2. يمنع نهائياً كتابة عبارات مثل (في الجزء الأول أو المقطع الثاني)، بل تعامل مع الحلقة كوحدة متصلة بالتوقيتات المطلقة.\n"
+        "3. استخرج النص الحرفي لآخر كلام قيل في ختام الحلقة مع توقيته المتصل وضعه في حقل lastSpokenWords.\n"
+        "4. أرجع كائن JSON حصراً بالحقول التالية:\n"
+        "   - isFullDurationAnalyzed: (boolean) ضعه true\n"
+        "   - analyzedAllSegments: (boolean) ضعه true\n"
+        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.\n"
+        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل والمنسق بـ HTML.\n"
+        "   - summarizedHtml: (string) التقرير المختصر والمنسق بـ HTML."
+    )
+
+    def build_final_text_parts(api_key, key_idx):
+        return [{"text": f"فيما يلي التحليل المفصل لكافة مقاطع الحلقة من البداية للنهاية، قم بإصدار كائن JSON النهائي للتقييم:\n\n{combined_notes}"}]
+
+    final_json_str, used_label, used_key_idx = call_gemini_low_mode_step(
+        system_prompt=final_sys_prompt,
+        user_parts_builder=build_final_text_parts,
+        models_list=models,
+        step_Title="إصدار التقرير النهائي الموحد",
+        expect_json=True
+    )
+
+    parsed = json.loads(final_json_str)
+    parsed["thinkingBanner"] = (
+        '<div class="low-mode-banner">'
+        '⚠️ <b>تنبيه نوع المنظومة:</b> تم اختيار <b>المنظومة المجانية (_LOW) (يتم أخذ صورة واحدة كل خمس ثوان - دقة متدنية)</b> '
+        'وهي منظومة اقتصادية أقل دقة مخصصة للباقة المجانية. '
+        'للحصول على الدقة التحليلية القصوى (صورة كل ثانية)، يرجى تسمية المجلد بدون لاحقة <code>_LOW</code>.'
+        '</div>'
+        f'<div class="thinking-note">المنظومة: {MODE_TITLE} | النموذج: {used_label} (Key #{used_key_idx})</div>'
+    )
+    return parsed
+
+def evaluate_with_gemini(segments, exact_duration, total_segments_count):
+    if IS_LOW_MODE:
+        return evaluate_low_free_mode(segments, exact_duration, total_segments_count)
+    else:
+        return evaluate_standard_pro_mode(segments, exact_duration, total_segments_count)
 
 def wrap_html(title, body_content):
     return f"""<!DOCTYPE html>
@@ -391,7 +538,6 @@ def main():
         elapsed = int(time.time() - START_TIME)
         elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
         
-        # هذا الوصف يقرؤه Google Apps Script ويرسله تلقائياً في نص الإيميل لجميع المستلمين
         summary_desc = (
             f"• المنظومة المختارة: {MODE_TITLE}\n"
             f"• عدد المقاطع المحللة: {total_segs_count} جزء\n"
@@ -414,7 +560,6 @@ def main():
     except Exception as e:
         log_step("❌ توقفت المعالجة بسبب خطأ.")
         error_msg = str(e)
-        # هذا الوصف يقرؤه Google Apps Script ويرسله تلقائياً في إيميل الفشل
         fail_desc = (
             f"• المنظومة المختارة: {MODE_TITLE}\n"
             f"• تفاصيل السبب:\n{error_msg[:1500]}"
