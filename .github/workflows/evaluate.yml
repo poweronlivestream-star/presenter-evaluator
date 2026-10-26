@@ -33,11 +33,14 @@ jobs:
       - name: Setup Python & Dependencies
         run: pip install requests
 
-      # 🛠️ الخطوة المضافة حديثاً لتثبيت FFmpeg و ffprobe على خادم السحابة
-      - name: Install FFmpeg
+      # ⚡ تثبيت FFmpeg بطريقة سريعة وثابتة (بدون apt-get وبدون تعليق)
+      - name: Install FFmpeg Statically (Instantly in 2 seconds)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          curl -L https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz
+          sudo cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/
+          sudo cp ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/
+          ffmpeg -version
 
       - name: Run FFmpeg & Gemini Evaluation
         env:
