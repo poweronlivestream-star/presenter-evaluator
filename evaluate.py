@@ -23,46 +23,28 @@ API_KEYS = [
     k.strip() for k in os.environ.get("GEMINI_API_KEYS", "").split(",") if k.strip()
 ]
 
-# تحديد نوع المنظومة تلقائياً من لاحقة اسم المجلد (_LOW أو _paid)
-IS_LOW_MODE = CLEAN_NAME.upper().endswith("_LOW")
-FORCE_PAID = CLEAN_NAME.upper().endswith("_PAID")
+# تحديد نوع المنظومة تلقائياً من لاحقة اسم المجلد (_LOW أو _PAID)
+UPPER_NAME = CLEAN_NAME.upper()
+IS_LOW_MODE = UPPER_NAME.endswith("_LOW")
+FORCE_PAID = UPPER_NAME.endswith("_PAID")
 
-MODE_TITLE = (
-    "المنظومة المدفوعة المباشرة (_paid)" if FORCE_PAID else
-    ("المنظومة المجانية (_LOW) (صورة كل 5 ثوان - دقة متدنية)" if IS_LOW_MODE else "المنظومة الاحترافية (الدقة القصوى - صورة كل ثانية)")
-)
+if FORCE_PAID:
+    MODE_TITLE = "المنظومة المدفوعة المباشرة (_PAID - الدقة القصوى)"
+elif IS_LOW_MODE:
+    MODE_TITLE = "المنظومة الاقتصادية (_LOW) (صورة كل 5 ثوان)"
+else:
+    MODE_TITLE = "المنظومة الاحترافية (الدقة القصوى - صورة كل ثانية) [تبدأ بالمجاني ثم المدفوع عند الفشل]"
 
 START_TIME = time.time()
 LOG_LINES = []
 
-# تتبع الميزانية الشهرية (حد أقصى 5$)
+# إعدادات سقف الإنفاق الشهري (5.00 دولار كحد أقصى)
 MAX_MONTHLY_BUDGET = 5.00
-BUDGET_TRACKER_FILE = "monthly_spend_tracker.json"
+SPEND_TRACKER_FILENAME = "_gemini_monthly_spend_tracker.json"
 
 session = requests.Session()
 retries = Retry(total=5, backoff_factor=3, status_forcelist=[500, 502, 504], raise_on_status=False)
 session.mount('https://', HTTPAdapter(max_retries=retries))
-
-def get_monthly_spend():
-    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-    if os.path.exists(BUDGET_TRACKER_FILE):
-        try:
-            with open(BUDGET_TRACKER_FILE, "r") as f:
-                data = json.load(f)
-                if data.get("month") == current_month:
-                    return data.get("spent", 0.0)
-        except:
-            pass
-    return 0.0
-
-def add_monthly_spend(amount):
-    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-    current_spent = get_monthly_spend()
-    new_spent = current_spent + amount
-    data = {"month": current_month, "spent": new_spent}
-    with open(BUDGET_TRACKER_FILE, "w") as f:
-        json.dump(data, f)
-    return new_spent
 
 def send_telegram(message, use_html=False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -92,16 +74,143 @@ def log_step(msg):
     print(line, flush=True)
     LOG_LINES.append(line)
     
-    send_telegram(f"🔔 تحديث معالجة ({CLEAN_NAME}):
-⚙️ {MODE_TITLE}
-{msg[:300]}", use_html=False)
+    send_telegram(f"🔔 تحديث معالجة ({CLEAN_NAME}):\n⚙️ {MODE_TITLE}\n{msg[:300]}", use_html=False)
     
     try:
         headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "text/plain; charset=utf-8"}
-        session.patch(f"https://www.googleapis.com/upload/drive/v3/files/{LOG_FILE_ID}?uploadType=media", headers=headers, data="
-".join(LOG_LINES).encode("utf-8"), timeout=20)
+        session.patch(
+            f"https://www.googleapis.com/upload/drive/v3/files/{LOG_FILE_ID}?uploadType=media",
+            headers=headers,
+            data="\n".join(LOG_LINES).encode("utf-8"),
+            timeout=20
+        )
     except Exception:
         pass
+
+# ==============================================================================
+# إدارة وحفظ ميزانية الـ 5$ الشهرية بشكل دائم على Google Drive
+# ==============================================================================
+def _find_spend_tracker_file_id():
+    headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
+    q = f"name = '{SPEND_TRACKER_FILENAME}' and trashed = false"
+    res = session.get(
+        "https://www.googleapis.com/drive/v3/files",
+        headers=headers,
+        params={"q": q, "fields": "files(id, name)", "pageSize": 1},
+        timeout=20
+    )
+    if res.status_code == 200:
+        files = res.json().get("files", [])
+        if files:
+            return files[0]["id"]
+    return None
+
+def get_monthly_spend():
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    try:
+        file_id = _find_spend_tracker_file_id()
+        if not file_id:
+            return 0.0
+        headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
+        res = session.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+            headers=headers,
+            timeout=20
+        )
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("month") == current_month:
+                return float(data.get("spent", 0.0))
+    except Exception as e:
+        print(f"تحذير أثناء قراءة سجل الإنفاق الشهري: {e}", flush=True)
+    return 0.0
+
+def add_monthly_spend(amount):
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    current_spent = get_monthly_spend()
+    new_spent = round(current_spent + float(amount), 6)
+    payload_bytes = json.dumps({
+        "month": current_month,
+        "spent": new_spent,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }).encode("utf-8")
+
+    try:
+        file_id = _find_spend_tracker_file_id()
+        if file_id:
+            headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json; charset=utf-8"}
+            session.patch(
+                f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media",
+                headers=headers,
+                data=payload_bytes,
+                timeout=20
+            )
+        else:
+            metadata = {"name": SPEND_TRACKER_FILENAME, "mimeType": "application/json"}
+            boundary = "===boundary_spend_tracker==="
+            body = (
+                f"--{boundary}\r\n"
+                "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                f"{json.dumps(metadata)}\r\n"
+                f"--{boundary}\r\n"
+                "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                f"{payload_bytes.decode('utf-8')}\r\n"
+                f"--{boundary}--"
+            ).encode("utf-8")
+            headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"multipart/related; boundary={boundary}"}
+            session.post(
+                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+                headers=headers,
+                data=body,
+                timeout=30
+            )
+    except Exception as e:
+        print(f"تحذير أثناء تحديث سجل الإنفاق الشهري: {e}", flush=True)
+    return new_spent
+
+def calculate_call_cost(model_name, usage_metadata):
+    in_tokens = int(usage_metadata.get("promptTokenCount", 0) or 0)
+    out_tokens = int(usage_metadata.get("candidatesTokenCount", 0) or 0)
+    think_tokens = int(usage_metadata.get("thoughtsTokenCount", 0) or 0)
+    total_out = out_tokens + think_tokens
+
+    if "pro" in model_name.lower():
+        in_rate = (1.25 / 1_000_000) if in_tokens <= 200_000 else (2.50 / 1_000_000)
+        out_rate = (10.00 / 1_000_000) if in_tokens <= 200_000 else (15.00 / 1_000_000)
+    else:
+        in_rate = 0.50 / 1_000_000
+        out_rate = 2.50 / 1_000_000
+
+    cost = (in_tokens * in_rate) + (total_out * out_rate)
+    return max(cost, 0.0001)
+
+def get_prioritized_keys():
+    """
+    ترتيب المفاتيح:
+    - المفتاح الأخير في GEMINI_API_KEYS يعتبر هو المفتاح المدفوع (PAID).
+    - جميع المفاتيح التي قبله تعتبر مفاتيح مجانية (FREE #1, FREE #2, ...).
+    - إذا كان اسم المجلد ينتهي بـ _paid، يتم الذهاب مباشرة للمفتاح المدفوع فقط.
+    """
+    if not API_KEYS:
+        raise RuntimeError("لا توجد مفاتيح API معرفة في GEMINI_API_KEYS.")
+
+    if len(API_KEYS) == 1:
+        only_type = "PAID" if FORCE_PAID else "Key #1"
+        return [(1, only_type, API_KEYS[0], FORCE_PAID)]
+
+    paid_key = API_KEYS[-1]
+    paid_idx = len(API_KEYS)
+    free_keys = API_KEYS[:-1]
+
+    if FORCE_PAID:
+        log_step(f"💳 اسم المجلد ينتهي بـ _paid: الانتقال المباشر إلى المفتاح المدفوع (Key #{paid_idx})...")
+        return [(paid_idx, f"PAID (Key #{paid_idx})", paid_key, True)]
+
+    ordered = []
+    for idx, fk in enumerate(free_keys, start=1):
+        ordered.append((idx, f"FREE (Key #{idx})", fk, False))
+    ordered.append((paid_idx, f"PAID (Key #{paid_idx})", paid_key, True))
+    return ordered
 
 def update_drive_folder(new_name, description_text=""):
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json"}
@@ -165,13 +274,13 @@ def prepare_media_segments(drive_files):
         log_step(f"⏱️ المدة الفعلية للحلقة: {exact_duration}")
         
         if IS_LOW_MODE:
-            log_step("✂️ تطبيق إعدادات المجاني: (صورة كل 5 ثوان + استخراج الصوت)...")
+            log_step("✂️ تطبيق إعدادات (_LOW): (صورة كل 5 ثوان - دقة متدنية) + استخراج الصوت...")
             subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", "48k", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Audio_part%02d.mp3"], check=True)
             subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "32", "-g", "5", "-maxrate", "100k", "-bufsize", "200k", "-vf", "scale=-2:480,fps=0.2", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
         else:
-            log_step("✂️ تقطيع الصوت (MP3) كل 25 دقيقة...")
+            log_step("✂️ جاري تشغيل FFmpeg لاستخراج وتقسيم الصوت (MP3) كل 25 دقيقة...")
             subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", "64k", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Audio_part%02d.mp3"], check=True)
-            log_step("🎞️ تقطيع الصورة (720p - 1fps) كل 25 دقيقة...")
+            log_step("🎞️ جاري تشغيل FFmpeg لاستخراج وتقسيم الصورة (فيديو خفيف 720p - 1fps) كل 25 دقيقة...")
             subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "30", "-maxrate", "150k", "-bufsize", "300k", "-vf", "scale=-2:720,fps=1", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
         
         segments = sorted(glob.glob("Audio_part*.mp3")) + sorted(glob.glob("Visuals_part*.mp4"))
@@ -234,28 +343,9 @@ def upload_to_gemini_file_api(filepath, api_key):
         file_info["state"] = chk.get("state")
     raise RuntimeError(f"لم يصبح الملف {filepath} في حالة ACTIVE بعد الرفع.")
 
-def get_prioritized_keys():
-    """
-    تحديد ترتيب المفاتيح بناءً على شروط المستخدم:
-    - إذا كان المجلد ينتهي بـ _paid، نبدأ مباشرة بالمفتاح المدفوع (الأخير في القائمة).
-    - وإلا، نبدأ بالمفاتيح المجانية أولاً (الأول والثاني)، ثم المدفوع أخيراً كـ Fallback.
-    """
-    if not API_KEYS:
-        raise RuntimeError("لا توجد مفاتيح API معرفة في GEMINI_API_KEYS.")
-    
-    paid_key = API_KEYS[-1] # المفتاح الأخير هو المدفوع (بـ 30$)
-    free_keys = API_KEYS[:-1] if len(API_KEYS) > 1 else []
-    
-    if FORCE_PAID:
-        log_step("💳 المجلد ينتهي بـ _paid: الانتقال مباشرة للمفتاح المدفوع...")
-        return [("PAID", paid_key)]
-    
-    keys_order = []
-    for idx, fk in enumerate(free_keys, start=1):
-        keys_order.append((f"FREE #{idx}", fk))
-    keys_order.append(("PAID", paid_key))
-    return keys_order
-
+# ==============================================================================
+# المسار الأول: النسخة الاحترافية (ترفع وتحلل دفعة واحدة مع التبديل الذكي للمفاتيح)
+# ==============================================================================
 def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
     models = [
         ("gemini-3.1-pro-preview", 24576, "gemini-3.1-pro-preview (Max Thinking 24576)", True),
@@ -273,8 +363,7 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
         end_str = format_hhmmss(accum_sec + dur)
         seg_timeline_info.append(f"- الجزء {idx:02d} ({aseg}): [{start_str}] -> [{end_str}]")
         accum_sec += dur
-    timeline_map_str = "
-".join(seg_timeline_info)
+    timeline_map_str = "\n".join(seg_timeline_info)
 
     system_prompt = (
         "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).\n"
@@ -293,32 +382,37 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
 
     prioritized_keys = get_prioritized_keys()
     errors = []
-    current_process_cost = 0.0
 
-    for key_type, api_key in prioritized_keys:
-        log_step(type_msg := f"🔑 محاولة المعالجة عبر حساب [{key_type}]...")
-        
-        # التحقق من سقف الميزانية إذا كنا سنستخدم الحساب المدفوع
-        if key_type == "PAID":
+    for key_idx, key_label, api_key, is_paid_key in prioritized_keys:
+        log_step(f"🔑 فحص المفتاح {key_label}...")
+
+        # فحص سقف الإنفاق الشهري (5$) قبل استخدام المفتاح المدفوع
+        if is_paid_key:
             current_monthly_spend = get_monthly_spend()
             if current_monthly_spend >= MAX_MONTHLY_BUDGET:
-                raise RuntimeError(f"❌ فشلت العملية: تم الوصول إلى الحد الأقصى للإنفاق الشهري (5$). الإجمالي الحالي: ${current_monthly_spend:.4f}")
-            log_step(f"💰 الميزانية الشهرية الحالية: ${current_monthly_spend:.4f} / ${MAX_MONTHLY_BUDGET:.2f}")
+                ceil_msg = (
+                    f"تم إيقاف العملية: وصل الإنفاق الشهري إلى الحد الأقصى المسموح به "
+                    f"(${current_monthly_spend:.4f} / ${MAX_MONTHLY_BUDGET:.2f})."
+                )
+                log_step(f"🛑 {ceil_msg}")
+                errors.append(f"• {key_label}: {ceil_msg}")
+                raise RuntimeError("\n".join(errors))
+            log_step(f"💰 فحص سقف الميزانية للمفتاح المدفوع: المستهلك هذا الشهر ${current_monthly_spend:.4f} من أصل ${MAX_MONTHLY_BUDGET:.2f}")
 
         try:
             prompt_parts = []
             for seg in segments:
-                log_step(f"☁️ رفع الجزء ({seg}) عبر [{key_type}]...")
+                log_step(f"☁️ رفع الجزء ({seg}) إلى Gemini باستخدام {key_label}...")
                 uri, mime = upload_to_gemini_file_api(seg, api_key)
                 prompt_parts.append({"text": f"الملف المرفق التالي هو: {seg}"})
                 prompt_parts.append({"fileData": {"mimeType": mime, "fileUri": uri}})
         except Exception as up_err:
-            errors.append(f"• حساب [{key_type}]: فشل رفع الملفات ({str(up_err)[:60]})")
-            log_step(f"⚠️ فشل الرفع عبر [{key_type}] - الانتقال للحساب التالي...")
+            log_step(f"⚠️ فشل رفع الملفات عبر {key_label} - الانتقال للمفتاح التالي...")
+            errors.append(f"• {key_label}: فشل رفع الملفات ({str(up_err)[:80]})")
             continue
 
         for model_name, budget, label, is_highest in models:
-            log_step(f"🧠 تحليل عبر النموذج: {label} [{key_type}]...")
+            log_step(f"🧠 بدء التحليل العميق لجميع الأجزاء عبر النموذج: {label} ({key_label})...")
             gen_cfg = {"temperature": 0.0, "responseMimeType": "application/json"}
             if budget > 0:
                 gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
@@ -335,42 +429,270 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
                 if res.status_code == 200:
                     data = res.json()
                     text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    
-                    # حساب التكلفة التقديرية إذا تم الاستخدام عبر الحساب المدفوع
-                    if key_type == "PAID":
-                        usage = data.get("usageMetadata", {})
-                        in_tokens = usage.get("promptTokenCount", 300000)
-                        out_tokens = usage.get("candidatesTokenCount", 5000)
-                        # تسعير تقريبي للـ Pro/Flash
-                        cost = (in_tokens * 0.00000125) + (out_tokens * 0.000005)
-                        current_process_cost = max(cost, 0.01) # حد أدنى رمزي للعملية
-                        new_total = add_monthly_spend(current_process_cost)
-                        log_step(f"💵 تكلفة العملية الحالية: ${current_process_cost:.4f} | إجمالي الشهر: ${new_total:.4f}")
-                    
                     parsed = json.loads(text)
-                    banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} [{key_type}]</div>'
+
+                    process_cost = 0.0
+                    if is_paid_key:
+                        usage = data.get("usageMetadata", {})
+                        process_cost = calculate_call_cost(model_name, usage)
+                        total_monthly = add_monthly_spend(process_cost)
+                        log_step(f"💵 تكلفة هذه العملية: ${process_cost:.4f} | إجمالي إنفاق الشهر: ${total_monthly:.4f} / ${MAX_MONTHLY_BUDGET:.2f}")
+                    else:
+                        total_monthly = get_monthly_spend()
+
+                    banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} ({key_label})</div>'
                     parsed["thinkingBanner"] = banner
                     parsed["costInfo"] = {
-                        "keyType": key_type,
-                        "processCost": current_process_cost,
-                        "totalMonthly": get_monthly_spend()
+                        "keyLabel": key_label,
+                        "isPaid": is_paid_key,
+                        "processCost": process_cost,
+                        "totalMonthly": total_monthly
                     }
                     return parsed
+                elif res.status_code == 429:
+                    err_msg = res.json().get("error", {}).get("message", "")
+                    match = re.search(r'Please retry in ([a-zA-Z0-9.]+)', err_msg)
+                    wait_time = match.group(1).split('.')[0] if match else "مؤقت"
+                    clean_err = f"المفتاح مستنفد (يعمل بعد: {wait_time})"
+                    log_step(f"⚠️ {clean_err} على {key_label} - انتقال للنموذج/المفتاح التالي...")
+                    errors.append(f"• {key_label} [{label}]: {clean_err}")
+                    continue
+                elif res.status_code == 503:
+                    log_step(f"⚠️ ضغط سيرفرات جوجل (503) على {label} ({key_label}) - انتقال للنموذج/المفتاح التالي...")
+                    errors.append(f"• {key_label} [{label}]: ضغط سيرفرات جوجل (503)")
+                    continue
                 else:
-                    err_txt = f"حالة HTTP {res.status_code}"
-                    log_step(f"⚠️ {err_txt} على [{key_type}] - انتقال للتالي...")
-                    errors.append(f"• حساب [{key_type}] [{label}]: {err_txt}")
-                    break # الانتقال للحساب التالي عند فشل النموذج
+                    log_step(f"⚠️ استجابة HTTP {res.status_code} على {label} ({key_label}) - انتقال للنموذج/المفتاح التالي...")
+                    errors.append(f"• {key_label} [{label}]: HTTP {res.status_code}")
+                    continue
             except Exception as req_err:
-                log_step(f"⚠️ خطأ اتصال على [{key_type}]...")
-                errors.append(f"• حساب [{key_type}] [{label}]: خطأ شبكة")
-                break
+                log_step(f"⚠️ خطأ اتصال على {label} ({key_label}) - انتقال للنموذج التالي...")
+                errors.append(f"• {key_label} [{label}]: خطأ شبكة ({str(req_err)[:50]})")
+                continue
 
-    raise RuntimeError("فشلت جميع الحسابات والمحاولات:\n" + "\n".join(errors))
+    raise RuntimeError("\n".join(errors))
+
+# ==============================================================================
+# المسار الثاني: نسخة (_LOW) - تحليل كل مقطع على حدة مع التبديل الذكي للمفاتيح
+# ==============================================================================
+def call_gemini_low_mode_step(system_prompt, user_parts_builder, models_list, step_title, expect_json=True):
+    prioritized_keys = get_prioritized_keys()
+    errors = []
+
+    for key_idx, key_label, api_key, is_paid_key in prioritized_keys:
+        if is_paid_key:
+            current_monthly_spend = get_monthly_spend()
+            if current_monthly_spend >= MAX_MONTHLY_BUDGET:
+                ceil_msg = (
+                    f"تم إيقاف العملية: وصل الإنفاق الشهري إلى الحد الأقصى المسموح به "
+                    f"(${current_monthly_spend:.4f} / ${MAX_MONTHLY_BUDGET:.2f})."
+                )
+                log_step(f"🛑 {ceil_msg}")
+                errors.append(f"• {key_label}: {ceil_msg}")
+                raise RuntimeError("\n".join(errors))
+
+        try:
+            prompt_parts = user_parts_builder(api_key, key_label)
+        except Exception as up_err:
+            errors.append(f"• {key_label} ({step_title}): فشل رفع الملفات ({str(up_err)[:50]})")
+            continue
+
+        for model_name, budget, label, is_highest in models_list:
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                log_step(f"🧠 [{step_title}] عبر {label} ({key_label} - محاولة {attempt}/{max_attempts})...")
+                gen_cfg = {"temperature": 0.0}
+                if expect_json:
+                    gen_cfg["responseMimeType"] = "application/json"
+                if budget > 0:
+                    gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
+
+                payload = {
+                    "systemInstruction": {"parts": [{"text": system_prompt}]},
+                    "contents": [{"role": "user", "parts": prompt_parts}],
+                    "generationConfig": gen_cfg
+                }
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+
+                try:
+                    res = session.post(url, json=payload, timeout=600)
+                    if res.status_code == 200:
+                        data = res.json()
+                        text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        step_cost = 0.0
+                        if is_paid_key:
+                            usage = data.get("usageMetadata", {})
+                            step_cost = calculate_call_cost(model_name, usage)
+                            add_monthly_spend(step_cost)
+                        return text, label, key_label, is_paid_key, step_cost
+
+                    elif res.status_code == 429:
+                        err_msg = res.json().get("error", {}).get("message", "")
+                        match = re.search(r'Please retry in ([a-zA-Z0-9.]+)', err_msg)
+                        wait_time = match.group(1).split('.')[0] if match else "مؤقت"
+                        clean_err = f"الحصة مستنفدة 429 (يعمل بعد: {wait_time})"
+
+                        if "h" not in wait_time and attempt < max_attempts:
+                            log_step(f"⏳ [{step_title}] امتلاء عداد الدقيقة ({wait_time}). تهدئة 65 ثانية ثم الإعادة...")
+                            time.sleep(65)
+                            continue
+
+                        log_step(f"⚠️ [{step_title}] {clean_err} على {key_label} - انتقال للنموذج/المفتاح التالي...")
+                        errors.append(f"• {key_label} [{label}]: {clean_err}")
+                        break
+
+                    elif res.status_code == 503:
+                        if attempt < max_attempts:
+                            wait_sec = 45 * attempt
+                            log_step(f"⏳ [{step_title}] ضغط سيرفرات جوجل (503) على {label}. انتظار {wait_sec} ثانية ثم الإعادة...")
+                            time.sleep(wait_sec)
+                            continue
+                        log_step(f"⚠️ [{step_title}] استمرار ضغط السيرفرات (503) على {label} - انتقال للتالي...")
+                        errors.append(f"• {key_label} [{label}]: ضغط سيرفرات جوجل (503)")
+                        break
+                    else:
+                        errors.append(f"• {key_label} [{label}]: HTTP {res.status_code}")
+                        break
+                except Exception as req_err:
+                    log_step(f"⚠️ [{step_title}] خطأ اتصال مؤقت: {str(req_err)[:50]}...")
+                    errors.append(f"• {key_label} [{label}]: {str(req_err)[:50]}")
+                    if attempt < max_attempts:
+                        time.sleep(30)
+                        continue
+                    break
+
+    raise RuntimeError("\n".join(errors))
+
+def evaluate_low_free_mode(segments, exact_duration, total_segments_count):
+    models = [
+        ("gemini-3.8-flash", 0,    "gemini-3.8-flash (Standard Fast)", True),
+        ("gemini-3.8-flash", 8192, "gemini-3.8-flash (Thinking 8192)", False)
+    ]
+
+    audio_segs = sorted(glob.glob("Audio_part*.mp3"))
+    visual_segs = sorted(glob.glob("Visuals_part*.mp4"))
+    num_parts = len(audio_segs)
+
+    part_configs = []
+    accum_sec = 0.0
+    for idx, aseg in enumerate(audio_segs):
+        dur = get_duration_seconds(aseg)
+        start_str = format_hhmmss(accum_sec)
+        end_str = format_hhmmss(accum_sec + dur)
+        vseg = visual_segs[idx] if idx < len(visual_segs) else None
+        part_configs.append({
+            "idx": idx,
+            "audio": aseg,
+            "visual": vseg,
+            "start_str": start_str,
+            "end_str": end_str
+        })
+        accum_sec += dur
+
+    part_summaries = []
+    used_label = ""
+    used_key_label = ""
+    any_paid_used = False
+    total_process_cost = 0.0
+
+    for p in part_configs:
+        idx = p["idx"]
+        is_last_part = (idx == num_parts - 1)
+        step_title = f"تحليل المقطع {idx + 1}/{num_parts} ({p['start_str']} -> {p['end_str']})"
+
+        part_sys_prompt = (
+            "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).\n"
+            f"أنت الآن تحلل المقطع رقم ({idx + 1} من {num_parts}) والذي يمتد في الحلقة الأصلية من التوقيت [{p['start_str']}] إلى [{p['end_str']}].\n"
+            "قواعد صارمة:\n"
+            f"1. قاعدة التوقيت المتصل: أضف دائماً وقت بداية هذا المقطع ({p['start_str']}) إلى أي توقيت ترصده داخل الملف، لتكون جميع التوقيتات المدونة بين [{p['start_str']}] و [{p['end_str']}].\n"
+            "2. استخرج تقريراً تحليلياً تفصيلياً وشاملاً لهذا المقطع يغطي كافة معايير سلم الـ 90 نقطة مع ذكر الشواهد والاقتباسات الحرفية بتوقيتاتها المتصلة.\n"
+            + ("3. هام جداً (المقطع الأخير): استمع بدقة إلى الدقيقة الأخيرة من هذا المقطع واكتب في نهاية تحليلك تحت عنوان [LAST_SPOKEN_WORDS] النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل ختام الحلقة مع توقيتها المتصل." if is_last_part else "")
+        )
+
+        def build_part_upload(api_key, key_label, part_info=p):
+            files_to_up = [part_info["audio"]]
+            if part_info["visual"]:
+                files_to_up.append(part_info["visual"])
+            parts_list = []
+            for fpath in files_to_up:
+                log_step(f"☁️ رفع ({fpath}) للمقطع {part_info['idx'] + 1}/{num_parts} عبر {key_label}...")
+                uri, mime = upload_to_gemini_file_api(fpath, api_key)
+                parts_list.append({"text": f"الملف المرفق: {fpath}"})
+                parts_list.append({"fileData": {"mimeType": mime, "fileUri": uri}})
+            parts_list.append({
+                "text": f"حلل هذا المقطع الممتد من [{part_info['start_str']}] إلى [{part_info['end_str']}] بالتفصيل وبتوقيتات متصلة."
+            })
+            return parts_list
+
+        part_text, used_label, used_key_label, is_paid, step_cost = call_gemini_low_mode_step(
+            system_prompt=part_sys_prompt,
+            user_parts_builder=build_part_upload,
+            models_list=models,
+            step_title=step_title,
+            expect_json=False
+        )
+        if is_paid:
+            any_paid_used = True
+            total_process_cost += step_cost
+        part_summaries.append(f"=== تحليل المقطع {idx + 1} (من {p['start_str']} إلى {p['end_str']}) ===\n{part_text}")
+
+        if not is_last_part:
+            log_step("⏳ تهدئة 35 ثانية قبل المقطع التالي لإراحة عداد التوكنز...")
+            time.sleep(35)
+
+    log_step("📊 دمج تحليلات جميع المقاطع وإصدار التقرير النهائي الموحد (90 نقطة)...")
+    combined_notes = "\n\n".join(part_summaries)
+
+    final_sys_prompt = (
+        "أنت خبير تقييم أداء مقدمي البرامج التلفزيونية وفق السلم المعتمد (90 نقطة).\n"
+        f"أمامك التحليلات التفصيلية الكاملة لجميع مقاطع الحلقة ({CLEAN_NAME}) والبالغة مدتها الإجمالية ({exact_duration}).\n"
+        "قواعد إجبارية صارمة:\n"
+        "1. قم بدمج وتوحيد هذه التحليلات في تقييم نهائي واحد متكامل وشامل للحلقة كاملة من (00:00:00) حتى (" + exact_duration + ") وفق سلم الـ 90 نقطة.\n"
+        "2. يمنع نهائياً كتابة عبارات مثل (في الجزء الأول أو المقطع الثاني)، بل تعامل مع الحلقة كوحدة متصلة بالتوقيتات المطلقة.\n"
+        "3. استخرج النص الحرفي لآخر كلام قيل في ختام الحلقة مع توقيته المتصل وضعه في حقل lastSpokenWords.\n"
+        "4. أرجع كائن JSON حصراً بالحقول التالية:\n"
+        "   - isFullDurationAnalyzed: (boolean) ضعه true\n"
+        "   - analyzedAllSegments: (boolean) ضعه true\n"
+        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.\n"
+        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل والمنسق بـ HTML.\n"
+        "   - summarizedHtml: (string) التقرير المختصر والمنسق بـ HTML."
+    )
+
+    def build_final_text_parts(api_key, key_label):
+        return [{"text": f"فيما يلي التحليل المفصل لكافة مقاطع الحلقة من البداية للنهاية، قم بإصدار كائن JSON النهائي للتقييم:\n\n{combined_notes}"}]
+
+    final_json_str, used_label, used_key_label, is_paid, step_cost = call_gemini_low_mode_step(
+        system_prompt=final_sys_prompt,
+        user_parts_builder=build_final_text_parts,
+        models_list=models,
+        step_title="إصدار التقرير النهائي الموحد",
+        expect_json=True
+    )
+    if is_paid:
+        any_paid_used = True
+        total_process_cost += step_cost
+
+    parsed = json.loads(final_json_str)
+    parsed["thinkingBanner"] = (
+        '<div class="low-mode-banner">'
+        '⚠️ <b>تنبيه نوع المنظومة:</b> تم اختيار <b>المنظومة الاقتصادية (_LOW) (صورة كل 5 ثوان)</b>. '
+        'للحصول على الدقة التحليلية القصوى (صورة كل ثانية)، يرجى تسمية المجلد بدون لاحقة <code>_LOW</code>.'
+        '</div>'
+        f'<div class="thinking-note">المنظومة: {MODE_TITLE} | النموذج: {used_label} ({used_key_label})</div>'
+    )
+    parsed["costInfo"] = {
+        "keyLabel": used_key_label,
+        "isPaid": any_paid_used,
+        "processCost": total_process_cost,
+        "totalMonthly": get_monthly_spend()
+    }
+    return parsed
 
 def evaluate_with_gemini(segments, exact_duration, total_segments_count):
-    # حالياً ندعم المسار الاحترافي والمدفوع المباشر بذكاء
-    return evaluate_standard_pro_mode(segments, exact_duration, total_segments_count)
+    if IS_LOW_MODE:
+        return evaluate_low_free_mode(segments, exact_duration, total_segments_count)
+    else:
+        return evaluate_standard_pro_mode(segments, exact_duration, total_segments_count)
 
 def wrap_html(title, body_content):
     return f"""<!DOCTYPE html>
@@ -378,6 +700,7 @@ def wrap_html(title, body_content):
 <head><meta charset="utf-8"><title>{title}</title>
 <style>
   body {{ font-family: "Arial", sans-serif; font-size: 14pt; line-height: 1.6; direction: rtl; text-align: right; color: #222222; max-width: 900px; margin: 40px auto; padding: 20px; background-color: #fdfdfd; }}
+  .low-mode-banner {{ background-color: #FFF3CD; color: #856404; border: 2px solid #FFEEBA; border-right: 6px solid #FFC107; padding: 12px 16px; margin-bottom: 18px; border-radius: 4px; font-size: 12pt; }}
   .thinking-note {{ font-size: 9pt; color: #666666; text-align: left; border-bottom: 1px dotted #cccccc; padding-bottom: 4px; margin-bottom: 15px; }}
   h1 {{ text-align: center; font-size: 20pt; font-weight: bold; color: #1F4E79; margin-bottom: 6px; }}
   h2 {{ font-size: 15pt; font-weight: bold; color: #1F4E79; margin-top: 22px; margin-bottom: 10px; border-bottom: 2px solid #1F4E79; padding-bottom: 5px; }}
@@ -406,7 +729,7 @@ def main():
         
         result = evaluate_with_gemini(segments, exact_duration, total_segs_count)
 
-        log_step(f"✅ تم بنجاح تحليل الحلقة ({total_segs_count} جزء) بمدة ({exact_duration})!")
+        log_step(f"✅ تم بنجاح تحليل كامل مقاطع الحلقة ({total_segs_count} جزء) بمدة ({exact_duration})!")
         
         main_html = wrap_html(f"تقييم تفصيلي - {CLEAN_NAME}", result.get("thinkingBanner", "") + result["mainDetailedHtml"])
         sum_html = wrap_html(f"تقرير مختصر - {CLEAN_NAME}", result.get("thinkingBanner", "") + result["summarizedHtml"])
@@ -417,15 +740,23 @@ def main():
         last_spoken = result.get("lastSpokenWords", "غير متوفر").strip()
         elapsed = int(time.time() - START_TIME)
         elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
-        
-        cost_info = result.get("costInfo", {"keyType": "FREE", "processCost": 0.0, "totalMonthly": get_monthly_spend()})
-        
+
+        cost_info = result.get("costInfo", {
+            "keyLabel": "FREE",
+            "isPaid": False,
+            "processCost": 0.0,
+            "totalMonthly": get_monthly_spend()
+        })
+
+        # هذا الوصف يقرأه Google Apps Script ويرسله في الإيميل تلقائياً
         summary_desc = (
-            f"• المنظومة: {MODE_TITLE}\n"
-            f"• الحساب المستخدم: {cost_info['keyType']}\n"
+            f"• المنظومة المختارة: {MODE_TITLE}\n"
+            f"• الحساب المستخدم: {cost_info['keyLabel']}\n"
             f"• تكلفة هذه العملية: ${cost_info['processCost']:.4f}\n"
-            f"• إجمالي الإنفاق هذا الشهر: ${cost_info['totalMonthly']:.2f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
-            f"• مدة الحلقة: {exact_duration} (الاستغراق: {elapsed_str})\n"
+            f"• إجمالي الإنفاق هذا الشهر: ${cost_info['totalMonthly']:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
+            f"• عدد المقاطع المحللة: {total_segs_count} جزء\n"
+            f"• المدة الإجمالية للحلقة: {exact_duration}\n"
+            f"• الوقت المستغرق: {elapsed_str}\n"
             f"• آخر كلام نُطق في ختام الحلقة:\n«{last_spoken}»"
         )
         update_drive_folder(f"PROCESSED_{CLEAN_NAME}", summary_desc)
@@ -435,8 +766,9 @@ def main():
             f"✅ تمت المعالجة والتقييم بنجاح!\n"
             f"📌 الحلقة: {CLEAN_NAME}\n"
             f"⚙️ المنظومة: {MODE_TITLE}\n"
-            f"💳 الحساب: {cost_info['keyType']} | التكلفة: ${cost_info['processCost']:.4f}\n"
-            f"📊 إجمالي الإنفاق الشهري: ${cost_info['totalMonthly']:.2f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
+            f"🔑 الحساب المستخدم: {cost_info['keyLabel']}\n"
+            f"💵 تكلفة العملية الحالية: ${cost_info['processCost']:.4f}\n"
+            f"📊 إجمالي الإنفاق هذا الشهر: ${cost_info['totalMonthly']:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
             f"⏱️ المدة: {exact_duration} | الاستغراق: {elapsed_str}\n\n"
             f"🎙️ آخر كلام في الحلقة:\n«{last_spoken}»\n\n"
             f"📁 رابط المجلد:\n{folder_url}",
@@ -445,8 +777,10 @@ def main():
     except Exception as e:
         log_step("❌ توقفت المعالجة بسبب خطأ.")
         error_msg = str(e)
+        current_monthly = get_monthly_spend()
         fail_desc = (
-            f"• المنظومة: {MODE_TITLE}\n"
+            f"• المنظومة المختارة: {MODE_TITLE}\n"
+            f"• إجمالي الإنفاق هذا الشهر: ${current_monthly:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
             f"• تفاصيل السبب:\n{error_msg[:1500]}"
         )
         update_drive_folder(f"FAILED_{CLEAN_NAME}", fail_desc)
@@ -454,6 +788,7 @@ def main():
         raw_fail_msg = (
             f"❌ فشل معالجة الحلقة: {CLEAN_NAME}\n"
             f"⚙️ المنظومة: {MODE_TITLE}\n"
+            f"📊 إجمالي الإنفاق هذا الشهر: ${current_monthly:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
             f"⚠️ تفاصيل الخطأ:\n{error_msg[:3000]}"
         )
         send_telegram(raw_fail_msg, use_html=False)
