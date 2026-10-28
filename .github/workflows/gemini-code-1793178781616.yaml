@@ -1,0 +1,36 @@
+name: Hourly Broadcast Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder_id:
+        required: true
+      file_id:
+        required: true
+      drive_token:
+        required: true
+
+jobs:
+  analyze_hour:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        run: pip install requests
+
+      - name: Install FFmpeg Statically
+        run: |
+          curl -L https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz
+          sudo cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/
+
+      - name: Run Hour Analysis
+        env:
+          FOLDER_ID: ${{ inputs.folder_id }}
+          FILE_ID: ${{ inputs.file_id }}
+          DRIVE_TOKEN: ${{ inputs.drive_token }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+        run: python analyze_broadcast.py
