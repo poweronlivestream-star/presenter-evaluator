@@ -7,34 +7,35 @@ on:
         description: 'Google Drive Folder ID'
         required: true
       clean_name:
-        description: 'Episode Clean Name'
+        description: 'Clean Episode Name'
         required: true
       log_file_id:
-        description: 'Live Log File ID on Drive'
+        description: 'Live Log File ID'
         required: true
       notify_email:
-        description: 'Notification Email'
-        required: true
+        description: 'Notification Emails'
+        required: false
       drive_token:
-        description: 'Temporary OAuth Token'
+        description: 'Google Drive OAuth Token'
         required: true
 
 jobs:
-  evaluate:
+  evaluate_presenter:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
-      - name: Mask OAuth Token
-        run: echo "::add-mask::${{ inputs.drive_token }}"
-
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Python & Dependencies
-        run: pip install requests
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      # ⚡ تثبيت FFmpeg بطريقة سريعة وثابتة (بدون apt-get وبدون تعليق)
-      - name: Install FFmpeg Statically (Instantly in 2 seconds)
+      - name: Install Dependencies
+        run: pip install requests yt-dlp
+
+      - name: Install FFmpeg & FFprobe (Static)
         run: |
           curl -L https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o ffmpeg.tar.xz
           tar -xf ffmpeg.tar.xz
@@ -42,14 +43,29 @@ jobs:
           sudo cp ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/
           ffmpeg -version
 
-      - name: Run FFmpeg & Gemini Evaluation
+      - name: Run Smart Presenter Evaluation Engine
         env:
           FOLDER_ID: ${{ inputs.folder_id }}
           CLEAN_NAME: ${{ inputs.clean_name }}
           LOG_FILE_ID: ${{ inputs.log_file_id }}
           NOTIFY_EMAIL: ${{ inputs.notify_email }}
           DRIVE_TOKEN: ${{ inputs.drive_token }}
+          GEMINI_FREE_API_KEYS: ${{ secrets.GEMINI_FREE_API_KEYS }}
+          GEMINI_PAID_API_KEY: ${{ secrets.GEMINI_PAID_API_KEY }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -u evaluate.py
+
+      - name: Upload Bulletproof Backup Evaluation Reports to GitHub Artifacts (Always Runs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: presenter-evaluation-backup-${{ github.run_id }}
+          path: ./backup_reports/
+          if-no-files-found: ignore
+          retention-days: 90
