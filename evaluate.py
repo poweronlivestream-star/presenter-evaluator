@@ -3,16 +3,9 @@
 """
 منظومة تقييم مقدمي البرامج التلفزيونية المحصنة (evaluate.py)
 - مطابقة 100% في الشكل والمعايير والقوالب (90 نقطة - 6 معايير أساسية - 23 معياراً فرعياً - التقرير المفصل + التقرير المختصر).
-- سحب الرابط من وصف المجلد (Folder Description) أولاً بنفس طريقة منظومة البث اليومي (analyze_broadcast)، أو من Google Doc / ملف نصي / ملف فيديو مرفوع، مع الحفاظ على الرابط داخل الوصف دائماً.
-- التدرج المالي الذكي الصارم والفحص المسبق للتكلفة عبر countTokens API:
-  * _free أو _low_free -> مجاني حصراً ($0.00)، فحص مسبق سريع ورفض فوري إذا لم يتوفر مفتاح مجاني صالح.
-  * _paid -> أقل تكلفة ممكنة (يستهلك المفاتيح المجانية أولاً بتكلفة $0.00 بدون انتظار طويل ثم ينتقل للمدفوع الاقتصادي).
-  * _paid_X.XX أو _max50c أو _cap0.80 -> يختار تلقائياً أعلى نموذج ومستوى تفكير (من Pro Max Thinking 24576 نزولاً إلى Flash) يدخل تحت السقف المالي المحدد!
-- الحماية الرباعية من ضياع التقارير (Zero-Data-Loss):
-  1) حفظ محلي في ./backup_reports/ لرفعه تلقائياً إلى GitHub Artifacts (يبقى 90 يوماً).
-  2) إرسال التقريرين كملفات HTML مرفقة مباشرة إلى Telegram قبل لمس Google Drive.
-  3) إرسال إيميل مباشر عبر SMTP (إن وجد) قبل لمس Google Drive.
-  4) رفع التقريرين إلى Google Drive وتحديث اسم المجلد ليقوم Code.gs بإرسال الإيميل الرسمي لجميع المستخدمين.
+- فحص مسبق فوري للحصة على المفاتيح المجانية خلال نصف ثانية لمنع إعادة الترفيع وضياع الوقت عند استنفاد الحصة.
+- إدراج سياسة اللهجة اللبنانية المحكية ضمن التوجيهات (ليست عيباً إطلاقاً ولا يُخصم عليها).
+- تنسيق HTML تنفيذي مخصص متوافق 100% مع Microsoft Word (ترويسة كحلية، صناديق ملونة، تيمزات واضحة).
 """
 
 import os
@@ -45,7 +38,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 BACKUP_DIR = os.path.abspath("./backup_reports")
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
-# جمع المفاتيح المجانية والمدفوعة (يدعم كلاً من متغيرات البث اليومي ومتغيرات تقييم المقدمين السابقة)
+# جمع المفاتيح المجانية والمدفوعة
 _free_env = (os.environ.get("GEMINI_FREE_API_KEYS", "") + "," + os.environ.get("GEMINI_API_KEYS", "")).strip(",")
 _paid_env = (os.environ.get("GEMINI_PAID_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")).strip()
 _legacy_list = [k.strip() for k in re.split(r"[,;\s]+", os.environ.get("GEMINI_API_KEYS", "")) if k.strip()]
@@ -67,7 +60,6 @@ for _k in re.split(r"[,;\s]+", _free_env):
 PAID_API_KEY = _paid_env if _paid_env else None
 API_KEYS = FREE_API_KEYS + ([PAID_API_KEY] if PAID_API_KEY else [])
 
-# تحديد نوع المنظومة والسقف المالي من اسم المجلد (يدعم صيغ البرودكاست _free / _paid / _paid_0.80 وصيغ التقييم _low / _max50c / _cap0.75)
 UPPER_NAME = CLEAN_NAME.upper()
 FORCE_FREE = UPPER_NAME.endswith("_FREE") or "_FREE_" in UPPER_NAME
 IS_LOW_MODE = UPPER_NAME.endswith("_LOW") or "_LOW_" in UPPER_NAME
@@ -82,16 +74,7 @@ SPEND_TRACKER_FILENAME = "_gemini_monthly_spend_tracker.json"
 
 
 def parse_episode_max_cost(folder_clean_name, default_cap=DEFAULT_MAX_EPISODE_COST):
-    """
-    يدعم جميع الصيغ الموحدة:
-    - _paid_0.50 أو _paid_1.20 (صيغة البرودكاست القياسية) -> 0.50$ أو 1.20$
-    - _max50c أو _50c أو _cap30c -> 0.50$ أو 0.30$
-    - _max0.40 أو _cap0.75 -> 0.40$ أو 0.75$
-    - _paid فقط بدون رقم -> وضع أقل تكلفة ممكنة (Ultra-Lean / Low-Cost) بسقف افتراضي
-    """
     upper = folder_clean_name.upper()
-
-    # 1. صيغة _paid_X.XX (المطابقة لمنظومة البث اليومي)
     m_paid_custom = re.search(r'_PAID_(\d+(?:\.\d+)?)', upper)
     if m_paid_custom:
         val = float(m_paid_custom.group(1))
@@ -99,13 +82,11 @@ def parse_episode_max_cost(folder_clean_name, default_cap=DEFAULT_MAX_EPISODE_CO
             val = val / 100.0
         return round(val, 4), f"محدد من اسم المجلد (_paid_{val:.2f}$)", False
 
-    # 2. صيغة السنتات _max50c أو _cap30c
     m_cents = re.search(r'_(?:MAX|CAP)?(\d+(?:\.\d+)?)C(?:ENTS)?(?=_|$)', upper)
     if m_cents:
         cents = float(m_cents.group(1))
         return round(cents / 100.0, 4), f"محدد من اسم المجلد ({cents:g} سنت = ${cents/100.0:.2f})", False
 
-    # 3. صيغة الدولار _max0.40 أو _cap1.2$
     m_max = re.search(r'_(?:MAX|CAP)(\d+(?:\.\d+)?)\$?(?=_|$)', upper)
     if m_max:
         val = float(m_max.group(1))
@@ -113,7 +94,6 @@ def parse_episode_max_cost(folder_clean_name, default_cap=DEFAULT_MAX_EPISODE_CO
             return round(val / 100.0, 4), f"محدد من اسم المجلد ({val:g} سنت = ${val/100.0:.2f})", False
         return round(val, 4), f"محدد من اسم المجلد (${val:.2f})", False
 
-    # 4. إذا كتب _paid فقط بدون رقم -> يطلب أقل تكلفة ممكنة (يستهلك المجاني أولاً ثم أرخص نموذج Flash)
     if upper.endswith("_PAID") or "_PAID_" in upper:
         return round(default_cap, 4), f"وضع أقل تكلفة ممكنة (_paid - سقف ${default_cap:.2f})", True
 
@@ -124,19 +104,19 @@ EPISODE_MAX_COST, EPISODE_COST_SOURCE, IS_PAID_MIN_COST = parse_episode_max_cost
 FORCE_PAID = ((UPPER_NAME.endswith("_PAID") or "_PAID_" in UPPER_NAME) and not FORCE_FREE)
 
 if FORCE_FREE and IS_LOW_MODE:
-    MODE_TITLE = "المنظومة المجانية الإجبارية الاقتصادية (_LOW_FREE - بدون أي سحب مالي)"
+    MODE_TITLE = "المنظومة المجانية الإجبارية الاقتصادية (_LOW_FREE)"
 elif FORCE_FREE:
-    MODE_TITLE = "المنظومة المجانية الإجبارية (_FREE - تتوقف فوراً إذا لم يتوفر رصيد مجاني)"
+    MODE_TITLE = "المنظومة المجانية الإجبارية (_FREE)"
 elif FORCE_PAID and IS_LOW_MODE:
     MODE_TITLE = f"المنظومة المدفوعة الاقتصادية (_LOW_PAID - {EPISODE_COST_SOURCE})"
 elif IS_PAID_MIN_COST:
     MODE_TITLE = f"المنظومة الذكية بأقل تكلفة ممكنة (_PAID - تبدأ بالمجاني ثم الأوفر مالياً | {EPISODE_COST_SOURCE})"
 elif FORCE_PAID:
-    MODE_TITLE = f"المنظومة المدفوعة المتدرجة ({EPISODE_COST_SOURCE} - تختار أعلى نموذج تحت السقف)"
+    MODE_TITLE = f"المنظومة المدفوعة المتدرجة ({EPISODE_COST_SOURCE})"
 elif IS_LOW_MODE:
-    MODE_TITLE = f"المنظومة الاقتصادية (_LOW) (صورة كل 5 ثوان) [تبدأ بالمجاني ثم المدفوع | {EPISODE_COST_SOURCE}]"
+    MODE_TITLE = f"المنظومة الاقتصادية (_LOW) [{EPISODE_COST_SOURCE}]"
 else:
-    MODE_TITLE = f"المنظومة الاحترافية المتدرجة (صورة كل ثانية) [تبدأ بالمجاني ثم المدفوع | {EPISODE_COST_SOURCE}]"
+    MODE_TITLE = f"المنظومة الاحترافية المتدرجة [{EPISODE_COST_SOURCE}]"
 
 SKILL_INSTRUCTIONS_AND_RUBRIC = """
 أنت خبير متخصص في تقييم الأداء المهني والتلفزيوني لمقدمي البرامج السياسية والحوارية وفق السلم المعتمد (90 نقطة).
@@ -145,247 +125,40 @@ SKILL_INSTRUCTIONS_AND_RUBRIC = """
 ================================================================================
 أولاً: القواعد الإلزامية الصارمة (PROJECT INSTRUCTIONS)
 ================================================================================
-1. المنع المطلق للتخمين (Zero Hallucination Policy):
-   - يُمنع منعاً باتاً توقع أو استنتاج أو تخمين أي معلومة غير موجودة صراحة في الفيديو أو الصوت المرفق (سواء كانت اسم مقدم، اسم ضيف، صفة ضيف، تاريخ، اسم برنامج، توقيت، أو اقتباس).
+1. قاعدة اللهجة اللبنانية المحكية (Lebanese Dialect Rule - جوهرية للغاية):
+   - استخدام المقدم للهجة العامية اللبنانية الطبيعية أو تطعيم الحوار بها ليس أمراً سلبياً على الإطلاق، ويُمنع منعاً باتاً خصم أي علامة بسببه في أي معيار.
+   - يُمنع منعاً باتاً إدراج "استخدام العامية أو اللهجة اللبنانية" ضمن نقاط الضعف أو "أولويات التطوير" أو المآخذ السلبية.
+   - التطعيم المتوازن باللهجة اللبنانية المحكية أسلوب تواصلي إيجابي ومحبب يكسر الجمود والركود ("البيئة الناشفة" للفصحى الصرفة) ويقرب المقدم من المشاهد.
+   - في معيار "اللغة والطلاقة (2 نقطة)"، تقتصر المحاسبة حصراً على: التلعثم، التردد المربك، مخارج الحروف، أو الأخطاء النحوية واللغوية الصريحة المرتکبة أثناء التحدث باللغة العربية الفصحى.
+
+2. المنع المطلق للتخمين (Zero Hallucination Policy):
+   - يُمنع منعاً باتاً توقع أو استنتاج أو تخمين أي معلومة غير موجودة صراحة في الفيديو أو الصوت المرفق.
    - إذا كانت أي معلومة أساسية غير مذكورة صراحة في المقطع، يُكتب مكانها "غير محدد في المقطع".
-   - تُبنى كافة البيانات والملاحظات والعلامات بنسبة 100% من محتوى الفيديو/الصوت الخاص بالحلقة الحالية حصراً.
 
-2. التحقق الإلزامي من مدة الحلقة وتحليلها بالكامل (Full Duration Verification):
-   - يجب تحليل الحلقة بالكامل من الثانية الأولى (00:00:00) وحتى آخر ثانية في المقطع الأخير دون أي انقطاع أو قفز أو أخذ عينات.
-   - التوقيت يكتب بصيغة واضحة ومتصلة من بداية الحلقة: `من 00:08:24 إلى 00:08:28` لمنع الانعكاس في RTL. ممنوع نهائياً كتابة "الجزء الأول" أو "المقطع الثاني".
+3. التحقق الإلزامي من مدة الحلقة وتحليلها بالكامل (Full Duration Verification):
+   - يجب تحليل الحلقة بالكامل من الثانية الأولى وحتى آخر ثانية في المقطع الأخير دون أي انقطاع.
+   - التوقيت يكتب بصيغة واضحة ومتصلة من بداية الحلقة: `من 00:08:24 إلى 00:08:28`.
 
-3. مراعاة الخط التحريري وسياق القناة (قاعدة جوهرية لا يجوز مخالفتها):
-   - يُجرى التقييم مع الأخذ في الحسبان الهوية التحريرية للقناة (إعلام داعم ومتبنٍّ لخط المقاومة).
-   - يُمنع منعاً باتاً خصم علامات أو انتقاد المقدم بسبب تبنيه لخط المقاومة أو استخدامه مصطلحاتها (مثل: كيان العدو، المقاومة، الشهيد، الاعتداءات الإسرائيلية) أو عدم لعبه دور "المحايد" تجاه العدو؛ فهذا التزام طبيعي بالسياسة التحريرية للقناة وليس عيباً مهنياً.
-   - التمايز بين "المونولوج العبثي" و"التوظيف التحريري الهادف": إذا كان الضيف حليفاً وفي مسار تفكيك لسرديات خصوم المقاومة، فإن ترك المساحة له قد يكون قراراً تحريرياً مقصوداً.
-   - حدود التوظيف التحريري: المونولوج الذي يتجاوز 3 دقائق متصلة دون أي مقاطعة وظيفية أو سؤال تلخيصي أو توجيهي من المقدم يُعد فشلاً تقنياً في إدارة الإيقاع التلفزيوني (Broken TV Rhythm)، ويجب المحاسبة عليه بخصم النقاط في معايير "التعامل مع الضيف"، "المتابعة والتعقيب"، و"ضبط الوقت".
-   - في معيار "الاختصار والحياد وتجنب تعدد الأسئلة"، يُقصد بالحياد المهني هنا: عدم مصادرة رأي الضيف بمقدمات تقريرية مطولة تفرض عليه الإجابة، وليس الحياد السياسي تجاه العدو.
-
-4. العمق التحليلي والشواهد الحية الموثقة (إلزامي في التقرير المفصل):
-   - يُمنع منعاً باتاً الاكتفاء بعبارات عامة أو ملخصات قصيرة! يجب أن تكون الملاحظات المهنية داخل الجداول غنية، ناقدة، ومفصلة، ومدعومة بـ:
-     أ) اقتباسات نصية حرفية (Verbatim Quotes) من كلام المقدم مع توقيتها الدقيق (مثلاً: رصد الانزلاقات إلى اللهجة العامية، العثرات اللفظية، صياغة الأسئلة الطويلة/المركبة، أو الأسئلة التتبعية الذكية).
-     ب) رصد بصري دقيق للغة الجسد والحضور التلفزيوني من ملفات الفيديو مع التوقيت الدقيق بالثانية (مثل: استقامة الجلسة، توزيع النظرات بين الضيف والكاميرا، حركة اليدين، العادات الحركية السلبية كلمس الوجه أو الذقن أو العبث باللحية، التلويح بالقلم، وتعابير الوجه أثناء الإصغاء).
-     ج) تحليل دقيق لإدارة الوقت والانتقالات بين ضيوف الاستوديو والمراسلين الميدانيين أو التقارير المسجلة (VT).
+4. مراعاة الخط التحريري وسياق القناة:
+   - يُجرى التقييم مع الأخذ في الحسبان الهوية التحريرية للقناة (إعلام داعم ومتبنٍّ لخط المقاومة). ممنوع خصم علامات بسبب استخدام مصطلحات المقاومة.
+   - حدود التوظيف التحريري: المونولوج الذي يتجاوز 3 دقائق متصلة دون أي مقاطعة وظيفية أو سؤال توجيهي من المقدم يُعد فشلاً تقنياً في إدارة الإيقاع (Broken TV Rhythm)، ويجب المحاسبة عليه بخصم النقاط.
 
 ================================================================================
-ثانياً: سلم العلامات المعتمد حصرياً (SCORING RUBRIC — 90 نقطة)
+ثانياً: سلم العلامات المعتمد حصرياً (90 نقطة)
 ================================================================================
-يُمنع منعاً باتاً اختراع معايير أخرى أو تغيير أوزانها! التزم حصراً بهذه المعايير الستة الأساسية ومعاييرها الفرعية الـ 23:
-
-1) إدارة الحلقة — 20 نقطة:
-   - بناء وتسلسل الملفات: 5
-   - إغلاق الملف والانتقال: 5
-   - السيطرة على المسار والمرونة: 5
-   - الافتتاح والخاتمة: 5
-
-2) التعامل مع الضيف — 20 نقطة:
-   - الإصغاء واحترام الجواب: 5
-   - توزيع المساحة وعدم المقاطعة غير الضرورية: 5
-   - المقاطعة الضرورية ومواجهة الضيف: 5
-   - احتواء المونولوج وإعادة المسار: 5
-
-3) جودة الأسئلة — 20 نقطة:
-   - وضوح السؤال: 4
-   - دقة السؤال: 4
-   - عمق السؤال: 4
-   - الارتباط بالمحور: 4
-   - الاختصار والحياد وتجنب تعدد الأسئلة: 4
-
-4) المتابعة والتعقيب — 15 نقطة:
-   - المتابعة المبنية على الجواب: 4
-   - التقاط النقاط المهمة والتناقضات: 4
-   - طلب التوضيح والتحقق: 3.5
-   - بناء السؤال التالي من الجواب: 3.5
-
-5) الحضور والأداء — 10 نقاط:
-   - الجاذبية التلفزيونية: 3
-   - لغة الجسد والتواصل البصري: 2.5
-   - الصوت والإلقاء: 2.5
-   - اللغة والطلاقة: 2
-
-6) ضبط الوقت — 5 نقاط:
-   - توزيع الوقت بين الملفات والضيوف: 1.7
-   - منع استنزاف الوقت في نقطة واحدة: 1.6
-   - إنهاء المحاور والخاتمة: 1.7
-
-(قاعدة العلامة: لا تجعل الانطباع العام يسبق الأدلة. الأدلة ← التصنيف ← العلامة. يجب أن يتطابق مجموع العلامات الفرعية مع علامة كل معيار أساسي، ومجموع المعايير الستة مع العلامة الإجمالية من 90).
+1) إدارة الحلقة — 20 نقطة.
+2) التعامل مع الضيف — 20 نقطة.
+3) جودة الأسئلة — 20 نقطة.
+4) المتابعة والتعقيب — 15 نقطة.
+5) الحضور والأداء — 10 نقاط.
+6) ضبط الوقت — 5 نقاط.
 
 ================================================================================
 ثالثاً: القالب الإلزامي الحرفي لمخرجات الـ HTML (template.md)
 ================================================================================
-1. يجب أن يحتوي حقل `mainDetailedHtml` على كود HTML الكامل لـ "التقرير الرئيسي المفصل" مطابقاً تماماً لهذا الهيكل وجميع جداوله الـ 6 الفرعية وجدول الأمثلة الموثقة (10 أمثلة على الأقل موزعة على كامل الحلقة):
-
-<h1>تقييم تفصيلي وفق المعايير الموسعة</h1>
-<div class="subtitle">[اسم المقدم] - [الشهر والسنة / عنوان الحلقة]</div>
-
-<table class="info-table">
-    <tr><td>المقدم</td><td>[اسم المقدم]</td></tr>
-    <tr><td>الحلقة</td><td>[نوع الحلقة / البرنامج - التاريخ]</td></tr>
-    <tr><td>الضيوف</td><td>[أسماء الضيوف والمراسلين وطريقة المشاركة: استديو / Zoom / مداخلة ميدانية]</td></tr>
-    <tr><td>المادة المسجلة</td><td>[تفاصيل التقارير VT أو المداخلات وتوقيتها من 00:00:00 إلى 00:00:00 أو لا يوجد]</td></tr>
-    <tr><td>مدة الحلقة</td><td>[المدة الدقيقة الكاملة بالثواني والدقائق - مع تأكيد تحليلها بالكامل]</td></tr>
-</table>
-
-<h2>الخلاصة التنفيذية</h2>
-<p>[فقرة تحليلية مكثفة ومعمقة من 5-8 أسطر تلخص المستوى العام للمقدم في الحلقة، أبرز ملامح الأداء في إدارة الحوار والأسئلة والمتابعة والحضور البصري واللغوي، ونقطة الضعف أو الاستنزاف الزمني الأساسية]</p>
-
-<table class="summary-strip">
-    <tr>
-        <td><span class="label">العلامة</span><span class="val">[ ] من 90</span></td>
-        <td><span class="label">النسبة</span><span class="val">[ ]%</span></td>
-        <td><span class="label">أبرز نقطة قوة</span><span class="val">[توصيف مركز]</span></td>
-        <td><span class="label">أولوية التطوير</span><span class="val">[توصيف مركز]</span></td>
-    </tr>
-</table>
-
-<h2>منهج التقييم</h2>
-<p>تم تطبيق السلم المعتمد: إدارة الحلقة 20، التعامل مع الضيف 20، جودة الأسئلة 20، المتابعة والتعقيب 15، الحضور والأداء 10، وضبط الوقت 5. التقييم مهني وتقني مع مراعاة الخط التحريري، وجرى استخدام التفريغ الموقّت والفيديو للتحقق من الانتقالات والحضور البصري على كامل مدة الحلقة.</p>
-
-<h2>العلامات الأساسية</h2>
-<table class="core-grid">
-    <tr>
-        <td>إدارة الحلقة: [ ] من 20</td>
-        <td>التعامل مع الضيف: [ ] من 20</td>
-        <td>جودة الأسئلة: [ ] من 20</td>
-    </tr>
-    <tr>
-        <td>المتابعة والتعقيب: [ ] من 15</td>
-        <td>الحضور والأداء: [ ] من 10</td>
-        <td>ضبط الوقت: [ ] من 5</td>
-    </tr>
-</table>
-
-<h2>1. إدارة الحلقة - [ ]/20</h2>
-<table>
-    <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>بناء وتسلسل الملفات</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>إغلاق الملف والانتقال</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>السيطرة على المسار والمرونة</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>الافتتاح والخاتمة</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-</table>
-
-<h2>2. التعامل مع الضيف - [ ]/20</h2>
-<table>
-    <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>الإصغاء واحترام الجواب</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>توزيع المساحة وعدم المقاطعة غير الضرورية</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>المقاطعة الضرورية ومواجهة الضيف</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>احتواء المونولوج وإعادة المسار</td><td>[ ]/5</td><td>[تحليل مفصل مع تطبيق قاعدة الـ 3 دقائق والخط التحريري بالتوقيتات]</td></tr>
-</table>
-
-<h2>3. جودة الأسئلة - [ ]/20</h2>
-<table>
-    <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>وضوح السؤال</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>دقة السؤال</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>عمق السؤال</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>الارتباط بالمحور</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>الاختصار والحياد وتجنب تعدد الأسئلة</td><td>[ ]/4</td><td>[تحليل طول الأسئلة والأسئلة المركبة مع ذكر مدتها وتوقيتها واقتباسها]</td></tr>
-</table>
-
-<h2>4. المتابعة والتعقيب - [ ]/15</h2>
-<table>
-    <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>المتابعة المبنية على الجواب</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>التقاط النقاط المهمة والتناقضات</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>طلب التوضيح والتحقق</td><td>[ ]/3.5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>بناء السؤال التالي من الجواب</td><td>[ ]/3.5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-</table>
-
-<h2>5. الحضور والأداء - [ ]/10</h2>
-<table>
-    <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>الجاذبية التلفزيونية</td><td>[ ]/3</td><td>[تحليل مفصل للهيئة والحضور والاتزان على الشاشة]</td></tr>
-    <tr><td>لغة الجسد والتواصل البصري</td><td>[ ]/2.5</td><td>[رصد بصري دقيق بالتوقيتات لحركة اليدين، النظرات، لمس الوجه/اللحية، استخدام القلم، والجلسة]</td></tr>
-    <tr><td>الصوت والإلقاء</td><td>[ ]/2.5</td><td>[تحليل الخامة الصوتية، التنغيم، مخارج الحروف، والنفس بالتوقيتات]</td></tr>
-    <tr><td>اللغة والطلاقة</td><td>[ ]/2</td><td>[رصد الفصحى والانزلاقات إلى العامية أو التلعثم مع إيراد اقتباسات حرفية بالتوقيتات]</td></tr>
-</table>
-
-<h2>6. ضبط الوقت - [ ]/5</h2>
-<table>
-    <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>توزيع الوقت بين الملفات والضيوف</td><td>[ ]/1.7</td><td>[تحليل مفصل لتوزيع الزمن بين المحاور والضيوف والمراسلين]</td></tr>
-    <tr><td>منع استنزاف الوقت في نقطة واحدة</td><td>[ ]/1.6</td><td>[تحليل مفصل مدعوم بالتوقيتات]</td></tr>
-    <tr><td>إنهاء المحاور والخاتمة</td><td>[ ]/1.7</td><td>[تحليل دقة إغلاق الحلقة في التوقيت الختامي]</td></tr>
-</table>
-
-<h2>أمثلة موثقة من الحلقة</h2>
-<table>
-    <tr><th style="width: 22%;">التوقيت</th><th style="width: 33%;">المثال (اقتباس حرفي أو رصد بصري)</th><th style="width: 45%;">الدلالة المهنية</th></tr>
-    <tr><td>من 00:00:00 إلى 00:00:00</td><td>[وصف الموقف أو الاقتباس الحرفي]</td><td>[تحليل الدلالة المهنية إيجاباً أو سلباً وربطها بالمعيار]</td></tr>
-    <!-- أدرج ما لا يقل عن 10 أمثلة موثقة موزعة على كامل مدة الحلقة من بدايتها لختامها -->
-</table>
-
-<h2>نقاط القوة الرئيسية</h2>
-<ul>
-    <li>[نقطة قوة مفصلة 1 مع التوقيت]</li>
-    <li>[نقطة قوة مفصلة 2 مع التوقيت]</li>
-    <li>[نقطة قوة مفصلة 3 مع التوقيت]</li>
-    <li>[نقطة قوة مفصلة 4 مع التوقيت]</li>
-</ul>
-
-<h2>أولويات التطوير</h2>
-<ul>
-    <li>[أولوية تطوير عملية 1 مع الشاهد الزمني]</li>
-    <li>[أولوية تطوير عملية 2 مع الشاهد الزمني]</li>
-    <li>[أولوية تطوير عملية 3 مع الشاهد الزمني]</li>
-    <li>[أولوية تطوير عملية 4 مع الشاهد الزمني]</li>
-</ul>
-
-<h2>الخلاصة النهائية</h2>
-<p>العلامة الحالية: [ ] من 90 ([ ]%). [فقرة ختامية مركزة تلخص مستوى الأداء العام والخطوة التطويرية الأهم لرفع العلامة مستقبلاً].</p>
-
----
-2. ويجب أن يحتوي حقل `summarizedHtml` على كود HTML الكامل لـ "التقرير المختصر" مطابقاً تماماً لهذا الهيكل:
-
-<h1>نموذج تقييم أداء مقدم/ة برنامج (تقرير مختصر)</h1>
-<table class="info-table">
-    <tr><td>اسم المقدم/ة</td><td>[اسم المقدم/ة]</td></tr>
-    <tr><td>التاريخ</td><td>[التاريخ]</td></tr>
-    <tr><td>البرنامج / نوع الحلقة</td><td>[البرنامج / نوع الحلقة]</td></tr>
-    <tr><td>الضيوف والمشاركون</td><td>[الضيوف والمشاركون]</td></tr>
-    <tr><td>المواد المسجلة</td><td>[المواد المسجلة]</td></tr>
-    <tr><td>مدة الحلقة</td><td>[مدة الحلقة]</td></tr>
-</table>
-
-<h2>الخلاصة التنفيذية</h2>
-<p>[الخلاصة التنفيذية]</p>
-
-<h2>النتيجة الإجمالية</h2>
-<table>
-    <tr><th style="width: 25%;">العلامة</th><th style="width: 20%;">النسبة</th><th style="width: 55%;">التوصيف المختصر</th></tr>
-    <tr><td><strong>[ ] من 90</strong></td><td><strong>[ ]%</strong></td><td>[التوصيف المختصر]</td></tr>
-</table>
-
-<h2>العلامات الأساسية</h2>
-<table>
-    <tr><th style="width: 25%;">المعيار</th><th style="width: 15%;">العلامة</th><th style="width: 60%;">ملاحظة مختصرة</th></tr>
-    <tr><td>إدارة الحلقة</td><td>[ ] من 20</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>التعامل مع الضيف</td><td>[ ] من 20</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>جودة الأسئلة</td><td>[ ] من 20</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>المتابعة والتعقيب</td><td>[ ] من 15</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>الحضور والأداء</td><td>[ ] من 10</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>ضبط الوقت</td><td>[ ] من 5</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr style="font-weight: bold; background-color: #D9E1F2;">
-        <td>المجموع الكلي</td><td>[ ] من 90</td><td>[خلاصة عامة]</td>
-    </tr>
-</table>
-
-<h2>نقاط القوة الرئيسية</h2>
-<ul>
-    <li>[نقطة قوة 1]</li>
-    <li>[نقطة قوة 2]</li>
-    <li>[نقطة قوة 3]</li>
-</ul>
-
-<h2>أولويات التطوير</h2>
-<ul>
-    <li>[أولوية تطوير 1]</li>
-    <li>[أولوية تطوير 2]</li>
-    <li>[أولوية تطوير 3]</li>
-</ul>
+1. حقل `mainDetailedHtml` يحتوي كود HTML الكامل لـ "التقرير الرئيسي المفصل" مع 6 جداول فرعية وجدول الأمثلة الموثقة (10 أمثلة على الأقل).
+2. حقل `summarizedHtml` يحتوي كود HTML الكامل لـ "التقرير المختصر".
 """
-
 
 session = requests.Session()
 retries = Retry(total=5, backoff_factor=3, status_forcelist=[500, 502, 504], raise_on_status=False)
@@ -404,19 +177,12 @@ def send_telegram(message, use_html=False):
         }
         if use_html:
             payload["parse_mode"] = "HTML"
-
-        res = requests.post(url, json=payload, timeout=15)
-        if res.status_code != 200 and use_html:
-            clean_text = re.sub(r'<[^>]+>', '', message)[:4000]
-            payload["text"] = clean_text
-            payload.pop("parse_mode", None)
-            requests.post(url, json=payload, timeout=15)
+        requests.post(url, json=payload, timeout=15)
     except Exception as e:
         print(f"خطأ في إرسال تليغرام: {e}", flush=True)
 
 
 def send_telegram_document(file_path, caption=""):
-    """إرسال ملف التقرير النهائي كوثيقة مرفقة مباشرة إلى Telegram كنسخة احتياطية مضمونة قبل لمس Drive"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not os.path.exists(file_path):
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
@@ -432,9 +198,7 @@ def send_telegram_document(file_path, caption=""):
             if r.status_code == 200:
                 print(f"✅ تم إرسال نسخة احتياطية من {os.path.basename(file_path)} إلى Telegram بنجاح!", flush=True)
                 return True
-        except Exception as e:
-            if attempt == 2:
-                print(f"⚠️ تعذر إرسال الملف إلى Telegram: {e}", flush=True)
+        except Exception:
             time.sleep(3)
     return False
 
@@ -473,30 +237,223 @@ def send_direct_smtp_email(subject, html_body, attachment_paths=None):
         return False
 
 
+def beautify_report_html(raw_html: str, run_cost_usd: float = 0.0) -> str:
+    """
+    تنسيق وتجميل تقرير التقييم (HTML) بألوان تنفيذية واضحة ومتوافقة مع Microsoft Word (RTL):
+    - ترويسة كحلية ملكية (.header-banner)
+    - صناديق زرقاء للخلاصة التنفيذية (.exec-box)
+    - صندوق أخضر زمردي لنقاط القوة (.strengths-box)
+    - صندوق كهرماني لأولويات التطوير (.priorities-box)
+    - تلوين خلايا العلامات في الجداول
+    """
+    if not raw_html:
+        return ""
+
+    html_content = re.sub(r"^```html\s*", "", raw_html.strip(), flags=re.IGNORECASE)
+    html_content = re.sub(r"^```\s*", "", html_content)
+    html_content = re.sub(r"\s*```$", "", html_content)
+
+    executive_css = """
+    <style>
+        @page { size: A4; margin: 1.8cm; }
+        body {
+            font-family: "Segoe UI", "Tahoma", "Arial", sans-serif;
+            font-size: 12pt;
+            line-height: 1.65;
+            direction: rtl;
+            text-align: right;
+            color: #0F172A;
+            max-width: 980px;
+            margin: 24px auto;
+            padding: 24px;
+            background-color: #FFFFFF;
+        }
+        .header-banner {
+            background-color: #1E3A8A;
+            color: #FFFFFF;
+            padding: 22px 24px;
+            border-radius: 8px;
+            border-bottom: 5px solid #F59E0B;
+            margin-bottom: 22px;
+            text-align: center;
+        }
+        .header-banner h1, h1 {
+            text-align: center;
+            font-size: 20pt;
+            font-weight: bold;
+            color: #FFFFFF;
+            margin: 0 0 6px 0;
+            page-break-after: avoid;
+        }
+        .subtitle {
+            text-align: center;
+            font-size: 13.5pt;
+            font-weight: bold;
+            color: #E2E8F0;
+            margin: 0;
+            page-break-after: avoid;
+        }
+        h2 {
+            font-size: 14.5pt;
+            font-weight: bold;
+            color: #1E3A8A;
+            background-color: #F1F5F9;
+            border-right: 6px solid #1E3A8A;
+            border-bottom: 1px solid #CBD5E1;
+            padding: 8px 14px;
+            margin-top: 24px;
+            margin-bottom: 12px;
+            border-radius: 4px;
+            page-break-after: avoid;
+        }
+        p { margin-top: 6px; margin-bottom: 12px; text-align: justify; }
+        .exec-box {
+            background-color: #EFF6FF;
+            border: 1px solid #BFDBFE;
+            border-right: 6px solid #1D4ED8;
+            padding: 14px 18px;
+            border-radius: 6px;
+            margin-bottom: 18px;
+        }
+        .strengths-box {
+            background-color: #F0FDF4;
+            border: 1px solid #BBF7D0;
+            border-right: 6px solid #16A34A;
+            padding: 14px 20px;
+            border-radius: 6px;
+            margin-bottom: 18px;
+        }
+        .strengths-box li { color: #064E3B; font-weight: 500; }
+        .priorities-box {
+            background-color: #FFFBEB;
+            border: 1px solid #FDE68A;
+            border-right: 6px solid #D97706;
+            padding: 14px 20px;
+            border-radius: 6px;
+            margin-bottom: 18px;
+        }
+        .priorities-box li { color: #78350F; font-weight: 500; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 18px;
+            page-break-inside: avoid;
+        }
+        table, th, td { border: 1px solid #CBD5E1; }
+        th, td {
+            padding: 9px 12px;
+            text-align: right;
+            vertical-align: top;
+            page-break-inside: avoid;
+        }
+        tr { page-break-inside: avoid; }
+        tr:nth-child(even) td { background-color: #F8FAFC; }
+        th {
+            background-color: #1E3A8A;
+            color: #FFFFFF;
+            font-weight: bold;
+            font-size: 11.5pt;
+        }
+        .score-cell {
+            text-align: center;
+            font-weight: bold;
+            color: #1E3A8A;
+            background-color: #EFF6FF !important;
+            font-size: 12pt;
+            white-space: nowrap;
+        }
+        .ts-badge {
+            display: inline-block;
+            background-color: #E0F2FE;
+            color: #0369A1;
+            border: 1px solid #BAE6FD;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-family: Consolas, monospace;
+            font-size: 10.5pt;
+            font-weight: bold;
+        }
+        ul { margin-top: 6px; margin-bottom: 8px; padding-right: 22px; }
+        li { margin-bottom: 8px; page-break-inside: avoid; }
+    </style>
+    """
+
+    if "<style>" in html_content:
+        html_content = re.sub(r"<style>.*?</style>", executive_css, html_content, count=1, flags=re.DOTALL)
+    elif "</head>" in html_content:
+        html_content = html_content.replace("</head>", f"{executive_css}\n</head>", 1)
+    else:
+        html_content = f"<!DOCTYPE html><html dir='rtl' lang='ar'><head><meta charset='utf-8'>{executive_css}</head><body>{html_content}</body></html>"
+
+    if 'class="header-banner"' not in html_content:
+        html_content = re.sub(
+            r"(<h1>.*?</h1>\s*(?:<div class=[\"']subtitle[\"']>.*?</div>)?)",
+            r'<div class="header-banner">\1</div>',
+            html_content,
+            count=1,
+            flags=re.DOTALL
+        )
+
+    html_content = re.sub(
+        r"(<h2>\s*الخلاصة التنفيذية\s*</h2>\s*)(?!<div class=[\"']exec-box[\"']>)(<p>.*?</p>)",
+        r'\1<div class="exec-box">\2</div>',
+        html_content,
+        flags=re.DOTALL
+    )
+    html_content = re.sub(
+        r"(<h2>\s*الخلاصة النهائية\s*</h2>\s*)(?!<div class=[\"']exec-box[\"']>)(<p>.*?</p>)",
+        r'\1<div class="exec-box">\2</div>',
+        html_content,
+        flags=re.DOTALL
+    )
+    html_content = re.sub(
+        r"(<h2>\s*نقاط القوة[^<]*</h2>\s*)(?!<div class=[\"']strengths-box[\"']>)(<ul>.*?</ul>)",
+        r'\1<div class="strengths-box">\2</div>',
+        html_content,
+        flags=re.DOTALL
+    )
+    html_content = re.sub(
+        r"(<h2>\s*أولويات التطوير[^<]*</h2>\s*)(?!<div class=[\"']priorities-box[\"']>)(<ul>.*?</ul>)",
+        r'\1<div class="priorities-box">\2</div>',
+        html_content,
+        flags=re.DOTALL
+    )
+    html_content = re.sub(
+        r"<td>\s*(\d+(?:\.\d+)?\s*(?:/|من)\s*\d+(?:\.\d+)?)\s*</td>",
+        r'<td class="score-cell">\1</td>',
+        html_content
+    )
+    html_content = re.sub(
+        r"(من\s+\d{2}:\d{2}(?::\d{2})?\s+إلى\s+\d{2}:\d{2}(?::\d{2})?)",
+        r'<span class="ts-badge">\1</span>',
+        html_content
+    )
+
+    cost_comment = f"<!-- COST_USD: {run_cost_usd:.4f} -->\n"
+    return cost_comment + html_content
+
+
 def save_bulletproof_backups(main_html_str, sum_html_str, summary_dict):
-    """
-    حفظ التقريرين وملف الملخص محلياً في ./backup_reports/ (لـ GitHub Artifacts)
-    وإرسالهما إلى Telegram و SMTP قبل أي اتصال بـ Google Drive لمنع ضياع أي نتيجة!
-    """
     os.makedirs(BACKUP_DIR, exist_ok=True)
     main_path = os.path.join(BACKUP_DIR, f"01_Main_Detailed_Report_{CLEAN_NAME}.html")
     sum_path = os.path.join(BACKUP_DIR, f"02_Summarized_Report_{CLEAN_NAME}.html")
     json_path = os.path.join(BACKUP_DIR, "_run_summary.json")
 
+    cost_val = summary_dict.get("processCost", summary_dict.get("process_cost_usd", 0.0))
+
     if main_html_str:
         with open(main_path, "w", encoding="utf-8") as f1:
-            f1.write(main_html_str)
+            f1.write(beautify_report_html(main_html_str, cost_val))
     if sum_html_str:
         with open(sum_path, "w", encoding="utf-8") as f2:
-            f2.write(sum_html_str)
+            f2.write(beautify_report_html(sum_html_str, cost_val))
     if summary_dict:
         with open(json_path, "w", encoding="utf-8") as f3:
             json.dump(summary_dict, f3, ensure_ascii=False, indent=2)
 
     if main_html_str and sum_html_str:
-        cost_val = summary_dict.get("processCost", 0.0)
-        cap_base = f"📎 نسخة احتياطية فورية ({CLEAN_NAME}) | التكلفة: ${cost_val:.4f}"
-        send_telegram_document(main_path, caption=cap_base + " - التقرير التفصيلي (90 نقطة)")
+        cap_base = f"📎 نسخة احتياطية ({CLEAN_NAME}) | التكلفة: ${cost_val:.4f}"
+        send_telegram_document(main_path, caption=cap_base + " - التقرير التفصيلي")
         send_telegram_document(sum_path, caption=cap_base + " - التقرير المختصر")
         send_direct_smtp_email(
             subject=f"✅ اكتمل تقييم الحلقة: {CLEAN_NAME} (التكلفة: ${cost_val:.4f})",
@@ -510,34 +467,34 @@ def log_step(msg):
     line = f"[{timestamp}] {msg}"
     print(line, flush=True)
     LOG_LINES.append(line)
-
-    send_telegram(f"🔔 تحديث معالجة ({CLEAN_NAME}):\n⚙️ {MODE_TITLE}\n{msg[:300]}", use_html=False)
-
-    if LOG_FILE_ID:
-        try:
-            headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "text/plain; charset=utf-8"}
-            session.patch(
-                f"https://www.googleapis.com/upload/drive/v3/files/{LOG_FILE_ID}?uploadType=media",
-                headers=headers,
-                data="\n".join(LOG_LINES).encode("utf-8"),
-                timeout=20
-            )
-        except Exception:
-            pass
+    send_telegram(f"🔔 تحديث ({CLEAN_NAME}):\n⚙️ {MODE_TITLE}\n{msg[:300]}", use_html=False)
 
 
 # ==============================================================================
-# إدارة وحفظ ميزانية الـ 5$ الشهرية بشكل دائم على Google Drive
+# الفحص المسبق لجاهزية الحصة (Pre-Upload Probe) لمنع إعادة الترفيع عند 429
 # ==============================================================================
+def probe_key_before_upload(api_key, key_label):
+    """يفحص المفتاح المجاني خلال نصف ثانية للتأكد من عدم استنفاد حصته قبل رفع الملفات."""
+    try:
+        url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=){api_key}"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+            "generationConfig": {"maxOutputTokens": 1}
+        }
+        res = session.post(url, json=payload, timeout=8)
+        if res.status_code == 200:
+            return True, "READY"
+        elif res.status_code in (429, 503):
+            return False, f"HTTP {res.status_code} (Quota Exhausted)"
+        return True, f"HTTP {res.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+
 def _find_spend_tracker_file_id():
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
     q = f"name = '{SPEND_TRACKER_FILENAME}' and trashed = false"
-    res = session.get(
-        "https://www.googleapis.com/drive/v3/files",
-        headers=headers,
-        params={"q": q, "fields": "files(id, name)", "pageSize": 1},
-        timeout=20
-    )
+    res = session.get("[https://www.googleapis.com/drive/v3/files](https://www.googleapis.com/drive/v3/files)", headers=headers, params={"q": q, "fields": "files(id, name)", "pageSize": 1}, timeout=20)
     if res.status_code == 200:
         files = res.json().get("files", [])
         if files:
@@ -552,17 +509,13 @@ def get_monthly_spend():
         if not file_id:
             return 0.0
         headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
-        res = session.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
-            headers=headers,
-            timeout=20
-        )
+        res = session.get(f"[https://www.googleapis.com/drive/v3/files/](https://www.googleapis.com/drive/v3/files/){file_id}?alt=media", headers=headers, timeout=20)
         if res.status_code == 200:
             data = res.json()
             if data.get("month") == current_month:
                 return float(data.get("spent", 0.0))
-    except Exception as e:
-        print(f"تحذير أثناء قراءة سجل الإنفاق الشهري: {e}", flush=True)
+    except Exception:
+        pass
     return 0.0
 
 
@@ -570,43 +523,20 @@ def add_monthly_spend(amount):
     current_month = datetime.now(timezone.utc).strftime("%Y-%m")
     current_spent = get_monthly_spend()
     new_spent = round(current_spent + float(amount), 6)
-    payload_bytes = json.dumps({
-        "month": current_month,
-        "spent": new_spent,
-        "updated_at": datetime.now(timezone.utc).isoformat()
-    }).encode("utf-8")
-
+    payload_bytes = json.dumps({"month": current_month, "spent": new_spent, "updated_at": datetime.now(timezone.utc).isoformat()}).encode("utf-8")
     try:
         file_id = _find_spend_tracker_file_id()
         if file_id:
             headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json; charset=utf-8"}
-            session.patch(
-                f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media",
-                headers=headers,
-                data=payload_bytes,
-                timeout=20
-            )
+            session.patch(f"[https://www.googleapis.com/upload/drive/v3/files/](https://www.googleapis.com/upload/drive/v3/files/){file_id}?uploadType=media", headers=headers, data=payload_bytes, timeout=20)
         else:
             metadata = {"name": SPEND_TRACKER_FILENAME, "mimeType": "application/json"}
             boundary = "===boundary_spend_tracker==="
-            body = (
-                f"--{boundary}\r\n"
-                "Content-Type: application/json; charset=UTF-8\r\n\r\n"
-                f"{json.dumps(metadata)}\r\n"
-                f"--{boundary}\r\n"
-                "Content-Type: application/json; charset=UTF-8\r\n\r\n"
-                f"{payload_bytes.decode('utf-8')}\r\n"
-                f"--{boundary}--"
-            ).encode("utf-8")
+            body = f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json.dumps(metadata)}\r\n--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{payload_bytes.decode('utf-8')}\r\n--{boundary}--".encode("utf-8")
             headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"multipart/related; boundary={boundary}"}
-            session.post(
-                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
-                headers=headers,
-                data=body,
-                timeout=30
-            )
-    except Exception as e:
-        print(f"تحذير أثناء تحديث سجل الإنفاق الشهري: {e}", flush=True)
+            session.post("[https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart](https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart)", headers=headers, data=body, timeout=30)
+    except Exception:
+        pass
     return new_spent
 
 
@@ -626,69 +556,27 @@ def calculate_call_cost(model_name, usage_metadata):
     think_tokens = int(usage_metadata.get("thoughtsTokenCount", 0) or 0)
     total_out = out_tokens + think_tokens
     in_rate, out_rate = get_model_rates(model_name, in_tokens)
-    cost = (in_tokens * in_rate) + (total_out * out_rate)
-    return max(cost, 0.0001)
-
-
-def count_input_tokens_pre_flight(model_name, system_prompt, contents, api_key, fallback_duration_sec=3600.0):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:countTokens?key={api_key}"
-    payload = {
-        "generateContentRequest": {
-            "model": f"models/{model_name}",
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": contents
-        }
-    }
-    try:
-        res = session.post(url, json=payload, timeout=30)
-        if res.status_code == 200:
-            total_t = int(res.json().get("totalTokens", 0) or 0)
-            if total_t > 0:
-                return total_t
-    except Exception:
-        pass
-    return int((fallback_duration_sec * 295) + 4500)
-
-
-def estimate_pre_flight_cost(model_name, in_tokens, thinking_budget, expected_report_tokens=9500):
-    in_rate, out_rate = get_model_rates(model_name, in_tokens)
-    estimated_thinking = int(thinking_budget * 0.45) if thinking_budget > 0 else 0
-    estimated_total_out = expected_report_tokens + estimated_thinking
-    est_cost = (in_tokens * in_rate) + (estimated_total_out * out_rate)
-    return round(est_cost, 4)
+    return max((in_tokens * in_rate) + (total_out * out_rate), 0.0001)
 
 
 def get_prioritized_keys():
-    """
-    فحص وترتيب المفاتيح (بأسلوب البرودكاست الذكي):
-    - يتحقق فعلياً من صلاحية المفاتيح قبل البدء.
-    - في وضع _free: يستخدم المفاتيح المجانية فقط، وإذا لم يتوفر أي مفتاح مجاني صالح يرفض فوراً في أول 5 ثوانٍ دون انتظار!
-    - في وضع _paid أو _paid_X.XX: يبدأ بالمفاتيح المجانية الصالحة أولاً بتكلفة $0.00 (مع انتقال فوري بدون انتظار طويل عند 429/503)، ثم ينتقل للمفتاح المدفوع.
-    """
-    def is_key_alive(k_str):
-        try:
-            r = session.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={k_str}", timeout=12)
-            return r.status_code == 200
-        except Exception:
-            return False
-
+    """يرتب المفاتيح، ويفحص الحصة المجانية فوراً لتجاوز أي مفتاح مستنفد دون تضييع الوقت."""
     valid_free = []
     for idx, fk in enumerate(FREE_API_KEYS, start=1):
-        if is_key_alive(fk):
+        is_ok, msg = probe_key_before_upload(fk, f"FREE (Key #{idx})")
+        if is_ok:
             valid_free.append((idx, f"FREE (Key #{idx})", fk, False))
+        else:
+            log_step(f"⚡ المفتاح المجاني (Key #{idx}) مستنفد مسبقاً ({msg}) - تخطي فوري بدون ترفيع.")
 
     valid_paid = None
-    if PAID_API_KEY and is_key_alive(PAID_API_KEY):
+    if PAID_API_KEY:
         p_idx = len(FREE_API_KEYS) + 1
         valid_paid = (p_idx, f"PAID (Key #{p_idx})", PAID_API_KEY, True)
 
     if FORCE_FREE:
         if not valid_free:
-            raise RuntimeError(
-                "رفض مسبق سريع (Pre-Flight Check): المجلد مضبوط على الوضع المجاني الإجباري (_free) "
-                "ولكن لا يوجد أي مفتاح مجاني صالح في الإعدادات. غير اسم المجلد إلى _paid لتشغيله."
-            )
-        log_step(f"🆓 وضع المجاني الإجباري (_free): تم التحقق من {len(valid_free)} مفاتيح مجانية صالحة (منع استخدام المفتاح المدفوع).")
+            raise RuntimeError("المجلد مضبوط على الوضع المجاني (_free) ولا توجد مفاتيح مجانية صالحة حالياً.")
         return valid_free
 
     ordered = list(valid_free)
@@ -696,34 +584,59 @@ def get_prioritized_keys():
         ordered.append(valid_paid)
 
     if not ordered:
-        raise RuntimeError("لا توجد أي مفاتيح Gemini صالحة (لا مجانية ولا مدفوعة) في GitHub Secrets.")
-
-    log_step(f"🔑 المفاتيح الفعالة الجاهزة: {len(valid_free)} مجاني + {1 if valid_paid else 0} مدفوع.")
+        raise RuntimeError("لا توجد أي مفاتيح Gemini صالحة في الإعدادات.")
     return ordered
 
 
-def update_drive_folder(new_name, description_text=""):
-    """تحديث اسم المجلد ووصفه مع الحفاظ الدائم على رابط المصدر الأصلي داخل الوصف (لكي لا يضيع عند إعادة المحاولة)"""
+def update_drive_folder_and_summary(folder_id, new_folder_name, run_cost_usd, monthly_spent_usd, model_used, thinking_level, duration_str, local_output_dir):
+    """يكتب التكلفة في _run_summary.json ووصف المجلد قبل تغيير اسم المجلد إلى PROCESSED_ لمنع ظهور الصفر ($0.00)."""
+    summary_data = {
+        "status": "SUCCESS",
+        "process_cost_usd": round(float(run_cost_usd), 4),
+        "total_cost_usd": round(float(run_cost_usd), 4),
+        "monthly_spend_usd": round(float(monthly_spent_usd), 4),
+        "model_used": model_used,
+        "thinking_level": thinking_level,
+        "duration_hms": duration_str
+    }
+
+    summary_path = os.path.join(local_output_dir, "_run_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary_data, f, ensure_ascii=False, indent=2)
+
+    # رفع _run_summary.json للدرايف
+    existing = session.get(
+        "[https://www.googleapis.com/drive/v3/files](https://www.googleapis.com/drive/v3/files)",
+        headers={"Authorization": f"Bearer {DRIVE_TOKEN}"},
+        params={"q": f"'{folder_id}' in parents and name = '_run_summary.json' and trashed = false", "fields": "files(id)"},
+        timeout=20
+    ).json().get("files", [])
+    for item in existing:
+        session.delete(f"[https://www.googleapis.com/drive/v3/files/](https://www.googleapis.com/drive/v3/files/){item['id']}", headers={"Authorization": f"Bearer {DRIVE_TOKEN}"}, timeout=15)
+
+    with open(summary_path, "rb") as sf:
+        session.post(
+            "[https://www.googleapis.com/upload/drive/v3/files?uploadType=media](https://www.googleapis.com/upload/drive/v3/files?uploadType=media)",
+            headers={"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json"},
+            data=sf.read(),
+            timeout=30
+        )
+
+    desc_text = (
+        f"COST_USD: ${run_cost_usd:.4f} | "
+        f"MONTH_USD: ${monthly_spent_usd:.4f} | "
+        f"MODEL: {model_used} ({thinking_level}) | "
+        f"DURATION: {duration_str}"
+    )
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json"}
-    payload = {"name": new_name}
-    if description_text:
-        if ORIGINAL_SOURCE_URL and ORIGINAL_SOURCE_URL not in description_text:
-            description_text = f"🔗 رابط المصدر: {ORIGINAL_SOURCE_URL}\n\n" + description_text
-        payload["description"] = description_text
-    try:
-        r = session.patch(f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}", headers=headers, json=payload, timeout=25)
-        return r.status_code in (200, 204)
-    except Exception as e:
-        print(f"⚠️ تحذير تحديث المجلد على Drive: {e}", flush=True)
-        return False
+    session.patch(f"[https://www.googleapis.com/drive/v3/files/](https://www.googleapis.com/drive/v3/files/){folder_id}", headers=headers, json={"name": new_folder_name, "description": desc_text}, timeout=25)
 
 
 def upload_report_to_drive(filename, content_str, mime_type="text/html"):
-    headers_list = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
     q = f"'{FOLDER_ID}' in parents and name = '{filename}' and trashed = false"
     existing_id = None
     try:
-        r_list = session.get("https://www.googleapis.com/drive/v3/files", headers=headers_list, params={"q": q, "fields": "files(id)"}, timeout=20)
+        r_list = session.get("[https://www.googleapis.com/drive/v3/files](https://www.googleapis.com/drive/v3/files)", headers={"Authorization": f"Bearer {DRIVE_TOKEN}"}, params={"q": q, "fields": "files(id)"}, timeout=20)
         if r_list.status_code == 200:
             files = r_list.json().get("files", [])
             if files:
@@ -731,57 +644,23 @@ def upload_report_to_drive(filename, content_str, mime_type="text/html"):
     except Exception:
         pass
 
-    try:
-        if existing_id:
-            up_url = f"https://www.googleapis.com/upload/drive/v3/files/{existing_id}?uploadType=media"
-            r = session.patch(
-                up_url,
-                headers={"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"{mime_type}; charset=UTF-8"},
-                data=content_str.encode("utf-8"),
-                timeout=45
-            )
-        else:
-            metadata = {"name": filename, "parents": [FOLDER_ID], "mimeType": mime_type}
-            boundary = "===boundary_report==="
-            body = (
-                f"--{boundary}\r\n"
-                "Content-Type: application/json; charset=UTF-8\r\n\r\n"
-                f"{json.dumps(metadata)}\r\n"
-                f"--{boundary}\r\n"
-                f"Content-Type: {mime_type}; charset=UTF-8\r\n\r\n"
-                f"{content_str}\r\n"
-                f"--{boundary}--"
-            ).encode("utf-8")
-            headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"multipart/related; boundary={boundary}"}
-            r = session.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", headers=headers, data=body, timeout=45)
-        return r.status_code in (200, 201)
-    except Exception as e:
-        print(f"⚠️ تحذير رفع التقرير {filename} إلى Drive: {e}", flush=True)
-        return False
-
-
-def get_drive_folder_metadata():
-    headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
-    r = session.get(
-        f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}",
-        headers=headers,
-        params={"fields": "id,name,description"},
-        timeout=25
-    )
-    if r.status_code == 200:
-        return r.json()
-    return {}
+    if existing_id:
+        session.patch(
+            f"[https://www.googleapis.com/upload/drive/v3/files/](https://www.googleapis.com/upload/drive/v3/files/){existing_id}?uploadType=media",
+            headers={"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"{mime_type}; charset=UTF-8"},
+            data=content_str.encode("utf-8"),
+            timeout=45
+        )
+    else:
+        metadata = {"name": filename, "parents": [FOLDER_ID], "mimeType": mime_type}
+        boundary = "===boundary_report==="
+        body = f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{json.dumps(metadata)}\r\n--{boundary}\r\nContent-Type: {mime_type}; charset=UTF-8\r\n\r\n{content_str}\r\n--{boundary}--".encode("utf-8")
+        session.post("[https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart](https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart)", headers={"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"multipart/related; boundary={boundary}"}, data=body, timeout=45)
 
 
 def list_drive_folder_contents():
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
-    q = f"'{FOLDER_ID}' in parents and trashed = false"
-    res = session.get(
-        "https://www.googleapis.com/drive/v3/files",
-        headers=headers,
-        params={"q": q, "fields": "files(id, name, mimeType, size)"},
-        timeout=30
-    )
+    res = session.get("[https://www.googleapis.com/drive/v3/files](https://www.googleapis.com/drive/v3/files)", headers=headers, params={"q": f"'{FOLDER_ID}' in parents and trashed = false", "fields": "files(id, name, mimeType, size)"}, timeout=30)
     res.raise_for_status()
     return res.json().get("files", [])
 
@@ -791,108 +670,46 @@ def extract_url_from_text(text):
         return None
     for m in re.finditer(r'(https?://[^\s<>"\'\r\n]+)', text):
         candidate = m.group(1).strip().rstrip('.,;)]}')
-        if "drive.google.com/drive/folders/" not in candidate:
+        if "[drive.google.com/drive/folders/](https://drive.google.com/drive/folders/)" not in candidate:
             return candidate
     return None
 
 
 def find_video_url_in_folder(all_files, folder_desc=""):
-    """
-    سحب الرابط بنفس طريقة منظومة البرودكاست (analyze_broadcast) بالضبط:
-    1. يفحص أولاً وصف المجلد (Folder Description) على Google Drive مباشرة!
-    2. يفحص أي مستند Google Doc داخل المجلد.
-    3. يفحص أي ملف نصي (.txt / .url / .webloc / .md) داخل المجلد.
-    """
     global ORIGINAL_SOURCE_URL
-    headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
-
-    # 1. الأولوية الأولى: وصف المجلد (Folder Description) مثل البرودكاست تماماً
     if folder_desc:
         url = extract_url_from_text(folder_desc)
         if url:
             ORIGINAL_SOURCE_URL = url
-            return url, "وصف المجلد (Folder Description)"
+            return url, "وصف المجلد"
 
-    try:
-        meta = get_drive_folder_metadata()
-        desc_live = meta.get("description", "") or ""
-        url = extract_url_from_text(desc_live)
-        if url:
-            ORIGINAL_SOURCE_URL = url
-            return url, "وصف المجلد (Folder Description)"
-    except Exception:
-        pass
-
-    # 2. الأولوية الثانية: مستند Google Doc أو ملف نصي داخل المجلد
     for f in all_files:
         fname = f.get("name", "")
-        if fname.startswith("00_") or fname.startswith("_") or fname.endswith(".html") or fname.endswith(".json"):
+        if fname.startswith("00_") or fname.startswith("_") or fname.endswith(".html"):
             continue
-        mime = f.get("mimeType", "")
         try:
-            if mime == "application/vnd.google-apps.document":
-                r = session.get(
-                    f"https://www.googleapis.com/drive/v3/files/{f['id']}/export",
-                    headers=headers,
-                    params={"mimeType": "text/plain"},
-                    timeout=20
-                )
+            if f.get("mimeType") == "application/vnd.google-apps.document":
+                r = session.get(f"[https://www.googleapis.com/drive/v3/files/](https://www.googleapis.com/drive/v3/files/){f['id']}/export", headers={"Authorization": f"Bearer {DRIVE_TOKEN}"}, params={"mimeType": "text/plain"}, timeout=20)
                 if r.status_code == 200:
                     url = extract_url_from_text(r.text)
                     if url:
                         ORIGINAL_SOURCE_URL = url
-                        return url, f"مستند Google Doc ({fname})"
-            elif mime.startswith("text/") or fname.lower().endswith((".txt", ".url", ".webloc", ".md")):
-                r = session.get(
-                    f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media",
-                    headers=headers,
-                    timeout=20
-                )
+                        return url, f"Google Doc ({fname})"
+            elif f.get("mimeType", "").startswith("text/") or fname.endswith((".txt", ".md")):
+                r = session.get(f"[https://www.googleapis.com/drive/v3/files/](https://www.googleapis.com/drive/v3/files/){f['id']}?alt=media", headers={"Authorization": f"Bearer {DRIVE_TOKEN}"}, timeout=20)
                 if r.status_code == 200:
                     url = extract_url_from_text(r.text)
                     if url:
                         ORIGINAL_SOURCE_URL = url
-                        return url, f"الملف النصي ({fname})"
+                        return url, f"ملف نصي ({fname})"
         except Exception:
             pass
-
     return None, None
-
-
-def upload_binary_file_to_drive_folder(local_path, drive_filename, mime_type="video/mp4"):
-    filesize = os.path.getsize(local_path)
-    init_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
-    headers = {
-        "Authorization": f"Bearer {DRIVE_TOKEN}",
-        "Content-Type": "application/json; charset=UTF-8",
-        "X-Upload-Content-Type": mime_type,
-        "X-Upload-Content-Length": str(filesize)
-    }
-    metadata = {"name": drive_filename, "parents": [FOLDER_ID]}
-    r = session.post(init_url, headers=headers, json=metadata, timeout=30)
-    r.raise_for_status()
-    upload_url = r.headers["Location"]
-
-    chunk_size = 16 * 1024 * 1024
-    offset = 0
-    with open(local_path, "rb") as f:
-        while offset < filesize:
-            chunk = f.read(chunk_size)
-            chunk_len = len(chunk)
-            end_byte = offset + chunk_len - 1
-            chunk_headers = {
-                "Content-Length": str(chunk_len),
-                "Content-Range": f"bytes {offset}-{end_byte}/{filesize}"
-            }
-            up_res = session.put(upload_url, headers=chunk_headers, data=chunk, timeout=180)
-            if up_res.status_code not in (200, 201, 308):
-                up_res.raise_for_status()
-            offset += chunk_len
 
 
 def download_drive_file(file_id, local_path):
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
-    with session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, stream=True, timeout=120) as r:
+    with session.get(f"[https://www.googleapis.com/drive/v3/files/](https://www.googleapis.com/drive/v3/files/){file_id}?alt=media", headers=headers, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(local_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
@@ -901,75 +718,27 @@ def download_drive_file(file_id, local_path):
 
 
 def download_video_from_external_url(url, local_path):
-    """
-    يدعم السحب من أي رابط في الوصف أو Google Doc (بنفس مرونة البرودكاست + دعم كامل للمنصات):
-    1. روابط Google Drive المشتركة
-    2. روابط البث المباشر أو المسجل (MP4 / M3U8 / TS) عبر التحميل المباشر أو FFmpeg المباشر
-    3. روابط يوتيوب، فيسبوك، ومواقع القنوات عبر yt-dlp
-    """
     gdrive_match = re.search(r'(?:/file/d/|id=)([a-zA-Z0-9_-]{20,})', url)
     if gdrive_match and "drive.google.com" in url:
-        file_id = gdrive_match.group(1)
-        log_step("☁️ الرابط هو ملف Google Drive - جاري السحب المباشر...")
         try:
-            download_drive_file(file_id, local_path)
+            download_drive_file(gdrive_match.group(1), local_path)
             if os.path.exists(local_path) and os.path.getsize(local_path) > 100_000:
                 return local_path
-        except Exception as e:
-            log_step(f"⚠️ تعذر السحب المباشر عبر API ({str(e)[:40]})، جاري المحاولة عبر yt-dlp...")
+        except Exception:
+            pass
 
-    is_direct_media = url.lower().split("?")[0].endswith((".mp4", ".mov", ".mkv", ".mp3", ".m4a", ".ts"))
-    if is_direct_media:
-        try:
-            log_step("🌐 جاري التحميل المباشر لملف الميديا من الرابط...")
-            with session.get(url, stream=True, timeout=120, headers={"User-Agent": "Mozilla/5.0"}) as r:
-                r.raise_for_status()
-                ctype = r.headers.get("Content-Type", "").lower()
-                if "text/html" not in ctype:
-                    with open(local_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
-                            if chunk:
-                                f.write(chunk)
-                    if os.path.exists(local_path) and os.path.getsize(local_path) > 100_000:
-                        return local_path
-        except Exception as e:
-            log_step(f"⚠️ التحويل إلى الفحص المباشر عبر FFprobe/yt-dlp ({str(e)[:40]})...")
-
-    # فحص ما إذا كان الرابط قابلاً للقراءة المباشرة عبر FFmpeg/FFprobe (مثل روابط البرودكاست المباشرة M3U8 / MP4 DVR)
     try:
-        probe_chk = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", url],
-            capture_output=True, text=True, timeout=25
-        )
-        if probe_chk.returncode == 0 and float(probe_chk.stdout.strip() or 0) > 0:
-            log_step("⚡ الرابط يدعم البث/التقطيع المباشر عبر FFmpeg (مثل منظومة البرودكاست تماماً)!")
-            return url
-    except Exception:
-        pass
-
-    log_step("⚙️ تجهيز محرك السحب السحابي (yt-dlp) وسحب الحلقة من الرابط...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp"], check=False)
-    if os.path.exists(local_path):
-        os.remove(local_path)
-
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-playlist",
-        "--no-check-certificates",
-        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "-o", local_path,
-        url
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0 or not os.path.exists(local_path):
-        err_tail = (res.stderr or res.stdout or "خطأ غير معروف")[-300:]
-        raise RuntimeError(f"فشل سحب الفيديو من الرابط ({url}):\n{err_tail}")
-    return local_path
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp"], check=False)
+        cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-check-certificates", "-f", "best[height<=720][ext=mp4]/best", "-o", local_path, url]
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 100_000:
+            return local_path
+    except Exception as e:
+        raise RuntimeError(f"فشل سحب الفيديو من الرابط: {e}")
 
 
-def get_duration_seconds(filepath_or_url):
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filepath_or_url]
+def get_duration_seconds(filepath):
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filepath]
     out = subprocess.check_output(cmd).decode("utf-8").strip()
     return float(out)
 
@@ -982,267 +751,92 @@ def format_hhmmss(seconds):
 def prepare_media_segments(drive_files, external_url=None, url_source=None):
     local_raw = "raw_episode.mp4"
     if external_url:
-        log_step(f"🔗 تم التقاط رابط الحلقة من {url_source}:\n{external_url}")
+        log_step(f"🔗 سحب الحلقة من {url_source}: {external_url}")
         media_input = download_video_from_external_url(external_url, local_raw)
-
-        if media_input == local_raw and os.path.exists(local_raw):
-            size_mb = os.path.getsize(local_raw) / (1024 * 1024)
-            log_step(f"✅ اكتمل سحب الفيديو من الرابط بنجاح ({size_mb:.1f} MB)!")
-            if "_NOSAVE" not in UPPER_NAME:
-                try:
-                    drive_mp4_name = f"{CLEAN_NAME}.mp4"
-                    log_step(f"☁️ جاري حفظ نسخة من الفيديو ({drive_mp4_name} - {size_mb:.1f} MB) داخل مجلد Google Drive...")
-                    upload_binary_file_to_drive_folder(local_raw, drive_mp4_name, mime_type="video/mp4")
-                    log_step("✅ تم حفظ ملف الـ MP4 داخل مجلد Google Drive بنجاح!")
-                except Exception as up_e:
-                    log_step(f"⚠️ تعذر حفظ نسخة الـ MP4 في الدرايف ({str(up_e)[:50]})، جاري متابعة التقييم...")
-
-        total_sec = get_duration_seconds(media_input)
-        exact_duration = format_hhmmss(total_sec)
-        log_step(f"⏱️ المدة الفعلية للحلقة: {exact_duration}")
-
-        if IS_LOW_MODE:
-            log_step("✂️ تطبيق إعدادات (_LOW): (صورة كل 5 ثوان - دقة 480p) + استخراج الصوت...")
-            subprocess.run(["ffmpeg", "-y", "-i", media_input, "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", "48k", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Audio_part%02d.mp3"], check=True)
-            subprocess.run(["ffmpeg", "-y", "-i", media_input, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "32", "-g", "5", "-maxrate", "100k", "-bufsize", "200k", "-vf", "scale=-2:480,fps=0.2", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
-        else:
-            log_step("✂️ جاري تشغيل FFmpeg لاستخراج وتقسيم الصوت (MP3) كل 25 دقيقة...")
-            subprocess.run(["ffmpeg", "-y", "-i", media_input, "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", "64k", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Audio_part%02d.mp3"], check=True)
-            log_step("🎞️ جاري تشغيل FFmpeg لاستخراج وتقسيم الصورة (فيديو خفيف 720p - 1fps) كل 25 دقيقة...")
-            subprocess.run(["ffmpeg", "-y", "-i", media_input, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "30", "-maxrate", "150k", "-bufsize", "300k", "-vf", "scale=-2:720,fps=1", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
-
-        segments = sorted(glob.glob("Audio_part*.mp3")) + sorted(glob.glob("Visuals_part*.mp4"))
-        return segments, exact_duration
-
-    if len(drive_files) == 1 and drive_files[0]["mimeType"].startswith("video/"):
-        raw_file = drive_files[0]
-        size_mb = int(raw_file.get("size", 0)) / (1024 * 1024)
-        log_step(f"📥 سحب ملف الفيديو الخام ({raw_file['name']} - {size_mb:.1f} MB)...")
-        download_drive_file(raw_file["id"], local_raw)
-        total_sec = get_duration_seconds(local_raw)
-        exact_duration = format_hhmmss(total_sec)
-        log_step(f"⏱️ المدة الفعلية للحلقة: {exact_duration}")
-
-        if IS_LOW_MODE:
-            log_step("✂️ تطبيق إعدادات (_LOW): (صورة كل 5 ثوان - دقة 480p) + استخراج الصوت...")
-            subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", "48k", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Audio_part%02d.mp3"], check=True)
-            subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "32", "-g", "5", "-maxrate", "100k", "-bufsize", "200k", "-vf", "scale=-2:480,fps=0.2", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
-        else:
-            log_step("✂️ جاري تشغيل FFmpeg لاستخراج وتقسيم الصوت (MP3) كل 25 دقيقة...")
-            subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", "64k", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Audio_part%02d.mp3"], check=True)
-            log_step("🎞️ جاري تشغيل FFmpeg لاستخراج وتقسيم الصورة (فيديو خفيف 720p - 1fps) كل 25 دقيقة...")
-            subprocess.run(["ffmpeg", "-y", "-i", local_raw, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "30", "-maxrate", "150k", "-bufsize", "300k", "-vf", "scale=-2:720,fps=1", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
-
-        segments = sorted(glob.glob("Audio_part*.mp3")) + sorted(glob.glob("Visuals_part*.mp4"))
-        return segments, exact_duration
+    elif len(drive_files) == 1 and drive_files[0]["mimeType"].startswith("video/"):
+        download_drive_file(drive_files[0]["id"], local_raw)
+        media_input = local_raw
     else:
-        local_files = []
-        total_audio_sec = 0.0
-        for f in drive_files:
-            log_step(f"📥 سحب الملف المقسم ({f['name']})...")
-            download_drive_file(f["id"], f["name"])
-            local_files.append(f["name"])
-            if f["mimeType"].startswith("audio/"):
-                total_audio_sec += get_duration_seconds(f["name"])
-        exact_duration = format_hhmmss(total_audio_sec) if total_audio_sec > 0 else "غير محدد"
-        return local_files, exact_duration
+        raise RuntimeError("لم يتم العثور على ملف فيديو صالح أو رابط معالجة في المجلد.")
+
+    total_sec = get_duration_seconds(media_input)
+    exact_duration = format_hhmmss(total_sec)
+    log_step(f"⏱️ المدة الفعلية للحلقة: {exact_duration}")
+
+    subprocess.run(["ffmpeg", "-y", "-i", media_input, "-vn", "-c:a", "libmp3lame", "-ac", "1", "-ar", "24000", "-b:a", "64k", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Audio_part%02d.mp3"], check=True)
+    subprocess.run(["ffmpeg", "-y", "-i", media_input, "-an", "-c:v", "libx264", "-preset", "faster", "-crf", "30", "-maxrate", "150k", "-bufsize", "300k", "-vf", "scale=-2:720,fps=1", "-f", "segment", "-segment_time", "1500", "-reset_timestamps", "1", "Visuals_part%02d.mp4"], check=True)
+
+    return sorted(glob.glob("Audio_part*.mp3")) + sorted(glob.glob("Visuals_part*.mp4")), exact_duration
 
 
 def upload_to_gemini_file_api(filepath, api_key):
     mime = "audio/mp3" if filepath.endswith(".mp3") else "video/mp4"
     filesize = os.path.getsize(filepath)
-
-    init_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}"
-    init_headers = {
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "X-Goog-Upload-Header-Content-Length": str(filesize),
-        "X-Goog-Upload-Header-Content-Type": mime,
-        "Content-Type": "application/json"
-    }
-    r = session.post(init_url, headers=init_headers, json={"file": {"display_name": filepath}}, timeout=30)
+    init_url = f"[https://generativelanguage.googleapis.com/upload/v1beta/files?key=](https://generativelanguage.googleapis.com/upload/v1beta/files?key=){api_key}"
+    r = session.post(init_url, headers={"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start", "X-Goog-Upload-Header-Content-Length": str(filesize), "X-Goog-Upload-Header-Content-Type": mime, "Content-Type": "application/json"}, json={"file": {"display_name": filepath}}, timeout=30)
     r.raise_for_status()
     upload_url = r.headers["X-Goog-Upload-URL"]
 
-    chunk_size = 8 * 1024 * 1024
-    offset = 0
-
     with open(filepath, "rb") as f:
-        while offset < filesize:
-            chunk = f.read(chunk_size)
-            is_final = (offset + len(chunk) >= filesize)
-            command = "upload, finalize" if is_final else "upload"
-
-            chunk_headers = {
-                "X-Goog-Upload-Protocol": "resumable",
-                "X-Goog-Upload-Command": command,
-                "X-Goog-Upload-Offset": str(offset),
-                "Content-Length": str(len(chunk))
-            }
-
-            up_res = session.post(upload_url, headers=chunk_headers, data=chunk, timeout=120)
-            up_res.raise_for_status()
-            offset += len(chunk)
+        data = f.read()
+        up_res = session.post(upload_url, headers={"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "upload, finalize", "X-Goog-Upload-Offset": "0", "Content-Length": str(filesize)}, data=data, timeout=180)
+        up_res.raise_for_status()
 
     file_info = up_res.json()["file"]
-
     for _ in range(60):
         if file_info.get("state") == "ACTIVE":
             return file_info["uri"], mime
         time.sleep(3)
         chk = session.get(f"{file_info['uri']}?key={api_key}", timeout=20).json()
         file_info["state"] = chk.get("state")
-    raise RuntimeError(f"لم يصبح الملف {filepath} في حالة ACTIVE بعد الرفع.")
+    raise RuntimeError(f"تخلف الملف {filepath} عن أن يصبح ACTIVE.")
 
 
-# ==============================================================================
-# المسار الأول: النسخة الاحترافية المتدرجة (تختار أعلى نموذج تحت السقف المالي)
-# ==============================================================================
-def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
-    # إذا طلب المستخدم _paid فقط بدون رقم (IS_PAID_MIN_COST)، يرتب النماذج من الأوفر (Flash) للأغلى،
-    # أما إذا حدد سقفاً مالياً (أو تركه افتراضياً)، يرتب النماذج من القمة (Pro Max Thinking 24576) نزولاً وينتقي أعلى نموذج يدخل تحت السقف!
-    pro_First_models = [
+def evaluate_with_gemini(segments, exact_duration):
+    models = [
         ("gemini-3.1-pro-preview", 24576, "gemini-3.1-pro-preview (Max Thinking 24576)", True),
-        ("gemini-3.1-pro-preview", 8192,  "gemini-3.1-pro-preview (Med Thinking 8192)",  False),
-        ("gemini-3.8-flash",       24576, "gemini-3.8-flash (High Thinking 24576)",      False),
-        ("gemini-3.8-flash",       8192,  "gemini-3.8-flash (Med Thinking 8192)",       False),
-        ("gemini-3.8-flash",       0,     "gemini-3.8-flash (Standard Fast)",            False),
-        ("gemini-3.7-flash",       8192,  "gemini-3.7-flash (Med Thinking 8192)",       False),
-        ("gemini-3.6-flash",       0,     "gemini-3.6-flash (Standard Fast)",            False),
+        ("gemini-3.8-flash", 24576, "gemini-3.8-flash (High Thinking 24576)", False),
+        ("gemini-3.8-flash", 0, "gemini-3.8-flash (Standard Fast)", False),
     ]
-    lean_first_models = [
-        ("gemini-3.8-flash",       8192,  "gemini-3.8-flash (Med Thinking 8192)",       False),
-        ("gemini-3.8-flash",       0,     "gemini-3.8-flash (Standard Fast)",            False),
-        ("gemini-3.7-flash",       0,     "gemini-3.7-flash (Standard Fast)",            False),
-        ("gemini-3.6-flash",       0,     "gemini-3.6-flash (Standard Fast)",            False),
-    ]
-    models = lean_first_models if IS_PAID_MIN_COST else pro_First_models
-
-    audio_segs = sorted(glob.glob("Audio_part*.mp3"))
-    seg_timeline_info = []
-    accum_sec = 0.0
-    for idx, aseg in enumerate(audio_segs):
-        dur = get_duration_seconds(aseg)
-        start_str = format_hhmmss(accum_sec)
-        end_str = format_hhmmss(accum_sec + dur)
-        seg_timeline_info.append(f"- الجزء {idx:02d} ({aseg}): [{start_str}] -> [{end_str}]")
-        accum_sec += dur
-    timeline_map_str = "\n".join(seg_timeline_info)
 
     system_prompt = (
-        f"{SKILL_INSTRUCTIONS_AND_RUBRIC}\n\n"
-        "================================================================================\n"
-        "رابعاً: خريطة التوقيت المتصل للأجزاء ومتطلبات إخراج JSON\n"
-        "================================================================================\n"
-        f"1. خريطة التوقيت المتصل للأجزاء المرفقة (المدة الإجمالية الدقيقة للحلقة {exact_duration}):\n{timeline_map_str}\n"
-        f"2. قاعدة التوقيت المطلق المتصل: اجمع توقيت أي لقطة أو اقتباس داخل الجزء مع وقت بداية ذلك الجزء الموضح في الخريطة أعلاه، لتكون كافة التوقيتات في التقرير متصلة من بداية الحلقة (00:00:00) حتى نهايتها ({exact_duration}).\n"
-        "3. التوثيق الحرفي لآخر كلام في الحلقة (lastSpokenWords): يجب عليك الاستماع إلى آخر دقيقة في آخر ملف صوتي مرفق، وتدوين النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل انتهاء الحلقة مباشرة مع توقيتها المتصل.\n"
-        "4. أرجع كائن JSON حصراً بالحقول التالية:\n"
-        "   - isFullDurationAnalyzed: (boolean) يجب أن يكون true حصراً بعد تحليل كامل المدة.\n"
-        "   - analyzedAllSegments: (boolean) يجب أن يكون true حصراً إذا تم تحليل كافة الأجزاء حتى الثانية الأخيرة.\n"
-        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.\n"
-        "   - mainDetailedHtml: (string) كود HTML الكامل والمفصل للتقرير الرئيسي شاملاً الجداول الفرعية الستة (23 معياراً فرعياً) والاقتباسات الحرفية والرصد البصري للغة الجسد وجدول الأمثلة الموثقة (10 أمثلة على الأقل).\n"
-        "   - summarizedHtml: (string) كود HTML الكامل للتقرير المختصر شاملاً جدول البيانات والنتيجة الإجمالية وجدول المعايير الستة الأساسية."
+        f"{SKILL_INSTRUCTIONS_AND_RUBRIC}\n"
+        f"مدة الحلقة الإجمالية: {exact_duration}. أرجع كائن JSON بالحقول: isFullDurationAnalyzed, analyzedAllSegments, lastSpokenWords, mainDetailedHtml, summarizedHtml."
     )
 
     prioritized_keys = get_prioritized_keys()
     errors = []
 
     for key_idx, key_label, api_key, is_paid_key in prioritized_keys:
-        log_step(f"🔑 فحص المفتاح {key_label}...")
-
-        if is_paid_key:
-            current_monthly_spend = get_monthly_spend()
-            if current_monthly_spend >= MAX_MONTHLY_BUDGET:
-                ceil_msg = (
-                    f"تم إيقاف العملية: وصل الإنفاق الشهري إلى الحد الأقصى المسموح به "
-                    f"(${current_monthly_spend:.4f} / ${MAX_MONTHLY_BUDGET:.2f})."
-                )
-                log_step(f"🛑 {ceil_msg}")
-                errors.append(f"• {key_label}: {ceil_msg}")
-                raise RuntimeError("\n".join(errors))
-            log_step(f"💰 فحص سقف الميزانية للمفتاح المدفوع: المستهلك هذا الشهر ${current_monthly_spend:.4f} من أصل ${MAX_MONTHLY_BUDGET:.2f}")
-
+        log_step(f"🔑 تجربة المفتاح {key_label}...")
         try:
             prompt_parts = []
             for seg in segments:
-                log_step(f"☁️ رفع الجزء ({seg}) إلى Gemini باستخدام {key_label}...")
+                log_step(f"☁️ رفع الجزء ({seg}) عبر {key_label}...")
                 uri, mime = upload_to_gemini_file_api(seg, api_key)
-                prompt_parts.append({"text": f"الملف المرفق التالي هو: {seg}"})
+                prompt_parts.append({"text": f"الملف المرفق: {seg}"})
                 prompt_parts.append({"fileData": {"mimeType": mime, "fileUri": uri}})
         except Exception as up_err:
-            log_step(f"⚠️ فشل رفع الملفات عبر {key_label} - الانتقال للمفتاح التالي...")
-            errors.append(f"• {key_label}: فشل رفع الملفات ({str(up_err)[:80]})")
+            errors.append(f"• {key_label}: فشل الرفع ({up_err})")
             continue
 
-        user_instruction = (
-            f"قم بتحليل وتقييم حلقة ({CLEAN_NAME}) بالكامل من 00:00:00 إلى {exact_duration} "
-            "وفق السلم المعتمد (90 نقطة - 6 معايير أساسية و23 معياراً فرعياً) والقوالب المعتمدة في التعليمات، "
-            "مع الالتزام التام بمراعاة الخط التحريري للقناة، وإيراد الاقتباسات الحرفية والشواهد البصرية للغة الجسد بالتوقيتات الدقيقة."
-        )
-        full_contents = [{"role": "user", "parts": prompt_parts + [{"text": user_instruction}]}]
-
-        in_tokens_count = None
-        if is_paid_key:
-            in_tokens_count = count_input_tokens_pre_flight(
-                models[0][0], system_prompt, full_contents, api_key, fallback_duration_sec=accum_sec
-            )
-            remaining_monthly = round(MAX_MONTHLY_BUDGET - get_monthly_spend(), 4)
-            effective_cap = min(EPISODE_MAX_COST, remaining_monthly)
-            log_step(
-                f"🧮 الفحص المسبق لتكلفة الحلقة كاملة ({len(segments)} أجزاء مجتمعة = {in_tokens_count:,} توكن) | "
-                f"سقف الحلقة الكلي المسموح: ${EPISODE_MAX_COST:.2f} ({EPISODE_COST_SOURCE}) | "
-                f"المتبقي من سقف الشهر: ${remaining_monthly:.2f}"
-            )
-
-        skipped_due_to_cost = []
         for model_name, budget, label, is_highest in models:
-            if is_paid_key and in_tokens_count is not None:
-                est_cost = estimate_pre_flight_cost(model_name, in_tokens_count, budget)
-                remaining_monthly = round(MAX_MONTHLY_BUDGET - get_monthly_spend(), 4)
-                effective_cap = min(EPISODE_MAX_COST, remaining_monthly)
-                if est_cost > effective_cap:
-                    skip_msg = f"تخطي {label}: التكلفة المقدرة (${est_cost:.3f}) أعلى من السقف المحدد للحلقة (${effective_cap:.2f})"
-                    log_step(f"💸 {skip_msg} - الانتقال لنموذج أوفر يناسب السقف...")
-                    skipped_due_to_cost.append(f"• {label}: مقدر بـ ${est_cost:.3f} (السقف ${effective_cap:.2f})")
-                    continue
-                else:
-                    log_step(f"✅ النموذج {label} يطابق سقف التكلفة المحدد (التكلفة المقدرة: ~${est_cost:.3f} <= ${effective_cap:.2f})...")
-
-            log_step(f"🧠 بدء التحليل العميق لجميع الأجزاء عبر النموذج: {label} ({key_label})...")
-            gen_cfg = {
-                "temperature": 0.0,
-                "maxOutputTokens": 65536,
-                "responseMimeType": "application/json"
-            }
+            log_step(f"🧠 تحليل عبر النموذج: {label} ({key_label})...")
+            gen_cfg = {"temperature": 0.0, "maxOutputTokens": 65536, "responseMimeType": "application/json"}
             if budget > 0:
                 gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
 
-            payload = {
-                "systemInstruction": {"parts": [{"text": system_prompt}]},
-                "contents": full_contents,
-                "generationConfig": gen_cfg
-            }
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-
+            payload = {"systemInstruction": {"parts": [{"text": system_prompt}]}, "contents": [{"role": "user", "parts": prompt_parts + [{"text": f"قيم حلقة {CLEAN_NAME} بالكامل وفق السلم المعتمد."}]}], "generationConfig": gen_cfg}
             try:
-                res = session.post(url, json=payload, timeout=600 if is_paid_key else 200)
+                res = session.post(f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_name}:generateContent?key={api_key}", json=payload, timeout=500)
                 if res.status_code == 200:
                     data = res.json()
                     text = data["candidates"][0]["content"]["parts"][0]["text"]
                     parsed = json.loads(text)
 
-                    process_cost = 0.0
-                    if is_paid_key:
-                        usage = data.get("usageMetadata", {})
-                        process_cost = calculate_call_cost(model_name, usage)
-                        total_monthly = add_monthly_spend(process_cost)
-                        log_step(f"💵 تكلفة هذه العملية: ${process_cost:.4f} | إجمالي إنفاق الشهر: ${total_monthly:.4f} / ${MAX_MONTHLY_BUDGET:.2f}")
-                    else:
-                        total_monthly = get_monthly_spend()
+                    process_cost = calculate_call_cost(model_name, data.get("usageMetadata", {})) if is_paid_key else 0.0
+                    total_monthly = add_monthly_spend(process_cost) if is_paid_key else get_monthly_spend()
 
-                    banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} ({key_label})</div>'
-                    parsed["thinkingBanner"] = banner
                     parsed["costInfo"] = {
                         "keyLabel": key_label,
                         "modelUsed": label,
@@ -1252,377 +846,40 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
                     }
                     return parsed
                 elif res.status_code == 429:
-                    err_msg = res.json().get("error", {}).get("message", "")
-                    match = re.search(r'Please retry in ([a-zA-Z0-9.]+)', err_msg)
-                    wait_time = match.group(1).split('.')[0] if match else "مؤقت"
-                    clean_err = f"المفتاح مستنفد (يعمل بعد: {wait_time})"
-                    log_step(f"⚡ {clean_err} على {key_label} - انتقال فوري بدون انتظار...")
-                    errors.append(f"• {key_label} [{label}]: {clean_err}")
-                    if not is_paid_key:
-                        break
-                    continue
-                elif res.status_code == 503:
-                    log_step(f"⚡ ضغط سيرفرات جوجل (503) على {label} ({key_label}) - انتقال فوري للنموذج/المفتاح التالي...")
-                    errors.append(f"• {key_label} [{label}]: ضغط سيرفرات جوجل (503)")
-                    continue
-                else:
-                    log_step(f"⚠️ استجابة HTTP {res.status_code} على {label} ({key_label}) - انتقال للنموذج/المفتاح التالي...")
-                    errors.append(f"• {key_label} [{label}]: HTTP {res.status_code}")
-                    continue
-            except Exception as req_err:
-                log_step(f"⚠️ خطأ اتصال على {label} ({key_label}) - انتقال للنموذج التالي...")
-                errors.append(f"• {key_label} [{label}]: خطأ شبكة ({str(req_err)[:50]})")
-                if not is_paid_key:
+                    log_step(f"⚡ المفتاح مستنفد ({key_label}) - انتقال فوري للمفتاح التالي.")
                     break
-                continue
-
-        if is_paid_key and skipped_due_to_cost:
-            log_step("🔄 جميع نماذج الدفعة الواحدة تتجاوز السقف المحدد — التحول التلقائي الذكي إلى مسار التجزئة الاقتصادية (_LOW) لإنجاز الحلقة ضمن السقف!")
-            return evaluate_low_free_mode(segments, exact_duration, total_segments_count)
+            except Exception as e:
+                errors.append(f"{key_label} [{label}]: {e}")
+                break
 
     raise RuntimeError("\n".join(errors))
-
-
-# ==============================================================================
-# المسار الثاني: نسخة (_LOW) - تحليل كل مقطع على حدة مع التبديل الذكي للمفاتيح
-# ==============================================================================
-def call_gemini_low_mode_step(system_prompt, user_parts_builder, models_list, step_title, expect_json=True, current_ep_spent=0.0):
-    prioritized_keys = get_prioritized_keys()
-    errors = []
-
-    for key_idx, key_label, api_key, is_paid_key in prioritized_keys:
-        if is_paid_key:
-            current_monthly_spend = get_monthly_spend()
-            if current_monthly_spend >= MAX_MONTHLY_BUDGET:
-                ceil_msg = (
-                    f"تم إيقاف العملية: وصل الإنفاق الشهري إلى الحد الأقصى المسموح به "
-                    f"(${current_monthly_spend:.4f} / ${MAX_MONTHLY_BUDGET:.2f})."
-                )
-                log_step(f"🛑 {ceil_msg}")
-                errors.append(f"• {key_label}: {ceil_msg}")
-                raise RuntimeError("\n".join(errors))
-            if current_ep_spent >= EPISODE_MAX_COST:
-                ep_ceil_msg = (
-                    f"تم إيقاف العملية: وصلت التكلفة التراكمية لأجزاء الحلقة (${current_ep_spent:.4f}) "
-                    f"إلى السقف الكلي المحدد للحلقة (${EPISODE_MAX_COST:.2f})."
-                )
-                log_step(f"🛑 {ep_ceil_msg}")
-                errors.append(f"• {key_label}: {ep_ceil_msg}")
-                raise RuntimeError("\n".join(errors))
-
-        try:
-            prompt_parts = user_parts_builder(api_key, key_label)
-        except Exception as up_err:
-            errors.append(f"• {key_label} ({step_title}): فشل رفع الملفات ({str(up_err)[:50]})")
-            continue
-
-        for model_name, budget, label, is_highest in models_list:
-            max_attempts = 3 if is_paid_key else 1
-            for attempt in range(1, max_attempts + 1):
-                log_step(f"🧠 [{step_title}] عبر {label} ({key_label} - محاولة {attempt}/{max_attempts})...")
-                gen_cfg = {"temperature": 0.0, "maxOutputTokens": 65536}
-                if expect_json:
-                    gen_cfg["responseMimeType"] = "application/json"
-                if budget > 0:
-                    gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
-
-                payload = {
-                    "systemInstruction": {"parts": [{"text": system_prompt}]},
-                    "contents": [{"role": "user", "parts": prompt_parts}],
-                    "generationConfig": gen_cfg
-                }
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-
-                try:
-                    res = session.post(url, json=payload, timeout=400 if is_paid_key else 180)
-                    if res.status_code == 200:
-                        data = res.json()
-                        text = data["candidates"][0]["content"]["parts"][0]["text"]
-                        step_cost = 0.0
-                        if is_paid_key:
-                            usage = data.get("usageMetadata", {})
-                            step_cost = calculate_call_cost(model_name, usage)
-                            add_monthly_spend(step_cost)
-                        return text, label, key_label, is_paid_key, step_cost
-
-                    elif res.status_code in (429, 503):
-                        clean_err = f"HTTP {res.status_code}"
-                        if not is_paid_key:
-                            log_step(f"⚡ [{step_title}] المفتاح المجاني ({key_label}) مشغول ({res.status_code}) — انتقال فوري للمفتاح التالي!")
-                            errors.append(f"• {key_label} [{label}]: {clean_err}")
-                            break
-                        if attempt < max_attempts:
-                            wait_sec = 25 * attempt
-                            log_step(f"⏳ [{step_title}] ضغط مؤقت ({res.status_code}) على المدفوع. انتظار {wait_sec} ثانية...")
-                            time.sleep(wait_sec)
-                            continue
-                        errors.append(f"• {key_label} [{label}]: {clean_err}")
-                        break
-                    else:
-                        errors.append(f"• {key_label} [{label}]: HTTP {res.status_code}")
-                        break
-                except Exception as req_err:
-                    log_step(f"⚠️ [{step_title}] خطأ اتصال مؤقت: {str(req_err)[:50]}...")
-                    errors.append(f"• {key_label} [{label}]: {str(req_err)[:50]}")
-                    if not is_paid_key:
-                        break
-                    if attempt < max_attempts:
-                        time.sleep(15)
-                        continue
-                    break
-
-    raise RuntimeError("\n".join(errors))
-
-
-def evaluate_low_free_mode(segments, exact_duration, total_segments_count):
-    models = [
-        ("gemini-3.8-flash", 0,    "gemini-3.8-flash (Standard Fast)", True),
-        ("gemini-3.8-flash", 8192, "gemini-3.8-flash (Thinking 8192)", False),
-        ("gemini-3.7-flash", 0,    "gemini-3.7-flash (Standard Fast)", False),
-        ("gemini-3.6-flash", 0,    "gemini-3.6-flash (Standard Fast)", False),
-    ]
-
-    audio_segs = sorted(glob.glob("Audio_part*.mp3"))
-    visual_segs = sorted(glob.glob("Visuals_part*.mp4"))
-    num_parts = len(audio_segs)
-
-    part_configs = []
-    accum_sec = 0.0
-    for idx, aseg in enumerate(audio_segs):
-        dur = get_duration_seconds(aseg)
-        start_str = format_hhmmss(accum_sec)
-        end_str = format_hhmmss(accum_sec + dur)
-        vseg = visual_segs[idx] if idx < len(visual_segs) else None
-        part_configs.append({
-            "idx": idx,
-            "audio": aseg,
-            "visual": vseg,
-            "start_str": start_str,
-            "end_str": end_str
-        })
-        accum_sec += dur
-
-    est_total_low_tokens = int((accum_sec * 180) + (num_parts * 4500))
-    est_total_low_cost = round((est_total_low_tokens * (0.15 / 1_000_000)) + ((num_parts + 1) * 4000 * (0.60 / 1_000_000)), 4)
-    if FORCE_PAID and est_total_low_cost > EPISODE_MAX_COST:
-        raise RuntimeError(
-            f"⛔ تم إيقاف العملية قبل السحب المالي: التكلفة الإجمالية المقدرة لجميع أجزاء الحلقة ({num_parts * 2} أجزاء) "
-            f"في الوضع الاقتصادي هي ~${est_total_low_cost:.3f} وهي أعلى من السقف المحدد للحلقة (${EPISODE_MAX_COST:.2f})."
-        )
-
-    part_summaries = []
-    used_label = ""
-    used_key_label = ""
-    any_paid_used = False
-    total_process_cost = 0.0
-
-    for p in part_configs:
-        idx = p["idx"]
-        is_last_part = (idx == num_parts - 1)
-        step_title = f"تحليل المقطع {idx + 1}/{num_parts} ({p['start_str']} -> {p['end_str']})"
-
-        part_sys_prompt = (
-            f"{SKILL_INSTRUCTIONS_AND_RUBRIC}\n\n"
-            f"أنت الآن تحلل المقطع رقم ({idx + 1} من {num_parts}) والذي يمتد في الحلقة الأصلية من التوقيت [{p['start_str']}] إلى [{p['end_str']}].\n"
-            "قواعد صارمة لهذا المقطع:\n"
-            f"1. قاعدة التوقيت المتصل: أضف دائماً وقت بداية هذا المقطع ({p['start_str']}) إلى أي توقيت ترصده داخل الملف، لتكون جميع التوقيتات المدونة بين [{p['start_str']}] و [{p['end_str']}].\n"
-            "2. استخرج تقريراً تحليلياً تفصيلياً وشاملاً لهذا المقطع يغطي المعايير الـ 6 الأساسية والـ 23 معياراً فرعياً، مع تدوين الاقتباسات الحرفية (للأسئلة، المقاطعات، العامية) والرصد البصري الدقيق للغة الجسد بتوقيتاتها المتصلة.\n"
-            + ("3. هام جداً (المقطع الأخير): استمع بدقة إلى الدقيقة الأخيرة من هذا المقطع واكتب في نهاية تحليلك تحت عنوان [LAST_SPOKEN_WORDS] النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل ختام الحلقة مع توقيتها المتصل." if is_last_part else "")
-        )
-
-        def build_part_upload(api_key, key_label, part_info=p):
-            files_to_up = [part_info["audio"]]
-            if part_info["visual"]:
-                files_to_up.append(part_info["visual"])
-            parts_list = []
-            for fpath in files_to_up:
-                log_step(f"☁️ رفع ({fpath}) للمقطع {part_info['idx'] + 1}/{num_parts} عبر {key_label}...")
-                uri, mime = upload_to_gemini_file_api(fpath, api_key)
-                parts_list.append({"text": f"الملف المرفق: {fpath}"})
-                parts_list.append({"fileData": {"mimeType": mime, "fileUri": uri}})
-            parts_list.append({
-                "text": f"حلل هذا المقطع الممتد من [{part_info['start_str']}] إلى [{part_info['end_str']}] بالتفصيل وبتوقيتات متصلة."
-            })
-            return parts_list
-
-        part_text, used_label, used_key_label, is_paid, step_cost = call_gemini_low_mode_step(
-            system_prompt=part_sys_prompt,
-            user_parts_builder=build_part_upload,
-            models_list=models,
-            step_title=step_title,
-            expect_json=False,
-            current_ep_spent=total_process_cost
-        )
-        if is_paid:
-            any_paid_used = True
-            total_process_cost += step_cost
-        part_summaries.append(f"=== تحليل المقطع {idx + 1} (من {p['start_str']} إلى {p['end_str']}) ===\n{part_text}")
-
-        if not is_last_part and not is_paid:
-            log_step("⏳ تهدئة 15 ثانية قبل المقطع التالي...")
-            time.sleep(15)
-
-    log_step("📊 دمج تحليلات جميع المقاطع وإصدار التقرير النهائي الموحد (90 نقطة)...")
-    combined_notes = "\n\n".join(part_summaries)
-
-    final_sys_prompt = (
-        f"{SKILL_INSTRUCTIONS_AND_RUBRIC}\n\n"
-        f"أمامك التحليلات التفصيلية الكاملة لجميع مقاطع الحلقة ({CLEAN_NAME}) والبالغة مدتها الإجمالية ({exact_duration}).\n"
-        "قواعد إجبارية صارمة:\n"
-        f"1. قم بدمج وتوحيد هذه التحليلات في تقييم نهائي واحد متكامل وشامل للحلقة كاملة من (00:00:00) حتى ({exact_duration}) وفق المعايير الستة الأساسية والـ 23 معياراً فرعياً والقوالب المعتمدة.\n"
-        "2. يمنع نهائياً كتابة عبارات مثل (في الجزء الأول أو المقطع الثاني)، بل تعامل مع الحلقة كوحدة متصلة بالتوقيتات المطلقة.\n"
-        "3. استخرج النص الحرفي لآخر كلام قيل في ختام الحلقة مع توقيته المتصل وضعه في حقل lastSpokenWords.\n"
-        "4. أرجع كائن JSON حصراً بالحقول التالية:\n"
-        "   - isFullDurationAnalyzed: (boolean) ضعه true\n"
-        "   - analyzedAllSegments: (boolean) ضعه true\n"
-        "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.\n"
-        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل والمنسق بـ HTML وفق القالب المعتمد.\n"
-        "   - summarizedHtml: (string) التقرير المختصر والمنسق بـ HTML وفق القالب المعتمد."
-    )
-
-    def build_final_text_parts(api_key, key_label):
-        return [{"text": f"فيما يلي التحليل المفصل لكافة مقاطع الحلقة من البداية للنهاية، قم بإصدار كائن JSON النهائي للتقييم:\n\n{combined_notes}"}]
-
-    final_json_str, used_label, used_key_label, is_paid, step_cost = call_gemini_low_mode_step(
-        system_prompt=final_sys_prompt,
-        user_parts_builder=build_final_text_parts,
-        models_list=models,
-        step_title="إصدار التقرير النهائي الموحد",
-        expect_json=True,
-        current_ep_spent=total_process_cost
-    )
-    if is_paid:
-        any_paid_used = True
-        total_process_cost += step_cost
-
-    parsed = json.loads(final_json_str)
-    parsed["thinkingBanner"] = (
-        '<div class="low-mode-banner">'
-        '⚠️ <b>تنبيه نوع المنظومة:</b> تم اختيار <b>المنظومة الاقتصادية (_LOW) (صورة كل 5 ثوان)</b>. '
-        'للحصول على الدقة التحليلية القصوى (صورة كل ثانية)، يرجى تسمية المجلد بدون لاحقة <code>_LOW</code>.'
-        '</div>'
-        f'<div class="thinking-note">المنظومة: {MODE_TITLE} | النموذج: {used_label} ({used_key_label})</div>'
-    )
-    parsed["costInfo"] = {
-        "keyLabel": used_key_label,
-        "modelUsed": used_label,
-        "isPaid": any_paid_used,
-        "processCost": round(total_process_cost, 4),
-        "totalMonthly": round(get_monthly_spend(), 4)
-    }
-    return parsed
-
-
-def evaluate_with_gemini(segments, exact_duration, total_segments_count):
-    if IS_LOW_MODE:
-        return evaluate_low_free_mode(segments, exact_duration, total_segments_count)
-    else:
-        return evaluate_standard_pro_mode(segments, exact_duration, total_segments_count)
-
-
-def clean_inner_html(raw_html):
-    """إزالة وسوم html/head/body المكررة إن قام النموذج بإضافتها داخل الحقل"""
-    body_match = re.search(r'<body[^>]*>(.*)</body>', raw_html, flags=re.DOTALL | re.IGNORECASE)
-    if body_match:
-        return body_match.group(1).strip()
-    raw_html = re.sub(r'<!DOCTYPE[^>]*>', '', raw_html, flags=re.IGNORECASE)
-    raw_html = re.sub(r'</?html[^>]*>', '', raw_html, flags=re.IGNORECASE)
-    raw_html = re.sub(r'<head>.*?</head>', '', raw_html, flags=re.DOTALL | re.IGNORECASE)
-    raw_html = re.sub(r'</?body[^>]*>', '', raw_html, flags=re.IGNORECASE)
-    return raw_html.strip()
-
-
-def wrap_html(title, body_content):
-    cleaned_body = clean_inner_html(body_content)
-    return f"""<!DOCTYPE html>
-<html xmlns:o="urn:schemas-microsoft-com:office:office"
-      xmlns:w="urn:schemas-microsoft-com:office:word"
-      xmlns="http://www.w3.org/TR/REC-html40"
-      dir="rtl" lang="ar">
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<!--[if gte mso 9]>
-<xml>
-  <w:WordDocument>
-    <w:View>Print</w:View>
-    <w:Zoom>100</w:Zoom>
-    <w:DoNotOptimizeForBrowser/>
-  </w:WordDocument>
-</xml>
-<![endif]-->
-<style>
-  @page {{ size: A4; margin: 2cm; }}
-  body {{ font-family: "Arial", sans-serif; font-size: 12.5pt; line-height: 1.6; direction: rtl; text-align: right; color: #111111; max-width: 950px; margin: 30px auto; padding: 20px; background-color: #ffffff; }}
-  .low-mode-banner {{ background-color: #FFF3CD; color: #856404; border: 2px solid #FFEEBA; border-right: 6px solid #FFC107; padding: 12px 16px; margin-bottom: 18px; border-radius: 4px; font-size: 11.5pt; }}
-  .thinking-note {{ font-size: 8.5pt; color: #666666; text-align: left; border-bottom: 1px dotted #cccccc; padding-bottom: 4px; margin-bottom: 12px; }}
-  h1 {{ text-align: center; font-size: 18pt; font-weight: bold; color: #1F4E79; margin-bottom: 4px; page-break-after: avoid; }}
-  .subtitle {{ text-align: center; font-size: 13pt; font-weight: bold; color: #595959; margin-top: 0; margin-bottom: 18px; page-break-after: avoid; }}
-  h2 {{ font-size: 14pt; font-weight: bold; color: #1F4E79; margin-top: 20px; margin-bottom: 8px; border-bottom: 1.5px solid #1F4E79; padding-bottom: 4px; page-break-after: avoid; }}
-  p {{ margin-top: 6px; margin-bottom: 10px; text-align: justify; }}
-  table {{ width: 100%; border-collapse: collapse; margin-bottom: 16px; page-break-inside: avoid; }}
-  table, th, td {{ border: 1px solid #444444; }}
-  th, td {{ padding: 8px 10px; text-align: right; vertical-align: top; page-break-inside: avoid; }}
-  tr {{ page-break-inside: avoid; page-break-after: auto; }}
-  th {{ background-color: #D9E1F2; color: #1F4E79; font-weight: bold; }}
-  .info-table td:first-child {{ font-weight: bold; background-color: #F2F2F2; width: 22%; }}
-  .summary-strip td {{ background-color: #F9FAFB; text-align: center; width: 25%; }}
-  .summary-strip .label {{ font-size: 10.5pt; color: #595959; display: block; }}
-  .summary-strip .val {{ font-size: 12.5pt; font-weight: bold; color: #1F4E79; }}
-  .core-grid td {{ width: 33.33%; background-color: #F9F9F9; font-weight: bold; }}
-  ul {{ margin-top: 6px; margin-bottom: 14px; padding-right: 22px; }}
-  li {{ margin-bottom: 6px; page-break-inside: avoid; }}
-</style>
-</head>
-<body>{cleaned_body}</body>
-</html>"""
 
 
 def main():
     try:
-        send_telegram(f"🚀 بدء معالجة حلقة: {CLEAN_NAME}\n⚙️ {MODE_TITLE}", use_html=False)
-        log_step(f"انطلاق معالجة الحلقة: {CLEAN_NAME} | {MODE_TITLE}")
-
-        # فحص مسبق للمفاتيح في أول 5 ثوانٍ قبل تحميل الفيديو (يرفض فوراً إذا كان _free بدون مفاتيح مجانية)
+        log_step(f"انطلاق المعالجة: {CLEAN_NAME} | {MODE_TITLE}")
         _ = get_prioritized_keys()
 
-        folder_meta = get_drive_folder_metadata()
-        folder_desc = folder_meta.get("description", "") or ""
-
+        folder_meta = session.get(f"[https://www.googleapis.com/drive/v3/files/](https://www.googleapis.com/drive/v3/files/){FOLDER_ID}", headers={"Authorization": f"Bearer {DRIVE_TOKEN}"}, params={"fields": "id,name,description"}, timeout=25).json()
         all_files = list_drive_folder_contents()
         drive_files = [f for f in all_files if f.get("mimeType", "").startswith("video/") or f.get("mimeType", "").startswith("audio/")]
-        drive_files.sort(key=lambda x: x["name"])
 
-        # الأولوية: إذا لم يوجد ملف فيديو مرفوع (أو وضع المستخدم الرابط في وصف المجلد / Google Doc / ملف نصي)
-        external_url, url_source = (None, None)
+        external_url, url_source = None, None
         if not drive_files:
-            external_url, url_source = find_video_url_in_folder(all_files, folder_desc=folder_desc)
+            external_url, url_source = find_video_url_in_folder(all_files, folder_meta.get("description", ""))
             if not external_url:
-                raise RuntimeError(
-                    "المجلد لا يحتوي على رابط فيديو في وصف المجلد (Folder Description) ولا مستند Google Doc ولا ملف نصي ولا ملف فيديو مرفوع."
-                )
+                raise RuntimeError("لم يتم العثور على أي رابط فيديو أو ملف مرفق في المجلد.")
 
-        segments, exact_duration = prepare_media_segments(drive_files, external_url=external_url, url_source=url_source)
-        total_segs_count = len(glob.glob("Audio_part*.mp3")) + len(glob.glob("Visuals_part*.mp4"))
+        segments, exact_duration = prepare_media_segments(drive_files, external_url, url_source)
+        result = evaluate_with_gemini(segments, exact_duration)
 
-        result = evaluate_with_gemini(segments, exact_duration, total_segs_count)
-
-        log_step(f"✅ تم بنجاح تحليل كامل مقاطع الحلقة ({total_segs_count} جزء) بمدة ({exact_duration})!")
-
-        main_html = wrap_html(f"تقييم تفصيلي - {CLEAN_NAME}", result.get("thinkingBanner", "") + result["mainDetailedHtml"])
-        sum_html = wrap_html(f"تقرير مختصر - {CLEAN_NAME}", result.get("thinkingBanner", "") + result["summarizedHtml"])
+        cost_info = result.get("costInfo", {"keyLabel": "FREE", "modelUsed": "gemini-3.8-flash", "isPaid": False, "processCost": 0.0, "totalMonthly": get_monthly_spend()})
+        main_html = beautify_report_html(result["mainDetailedHtml"], cost_info["processCost"])
+        sum_html = beautify_report_html(result["summarizedHtml"], cost_info["processCost"])
 
         last_spoken = result.get("lastSpokenWords", "غير متوفر").strip()
         elapsed = int(time.time() - START_TIME)
         elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
-
-        cost_info = result.get("costInfo", {
-            "keyLabel": "FREE",
-            "modelUsed": "gemini-3.8-flash",
-            "isPaid": False,
-            "processCost": 0.0,
-            "totalMonthly": get_monthly_spend()
-        })
 
         summary_json_data = {
             "status": "SUCCESS",
@@ -1630,81 +887,41 @@ def main():
             "mode_title": MODE_TITLE,
             "model_used": cost_info.get("modelUsed", ""),
             "key_label": cost_info["keyLabel"],
-            "processCost": cost_info["processCost"],
             "process_cost_usd": cost_info["processCost"],
             "episode_budget_usd": EPISODE_MAX_COST,
             "monthly_spend_usd": cost_info["totalMonthly"],
             "monthly_cap_usd": MAX_MONTHLY_BUDGET,
             "duration_hms": exact_duration,
-            "segments_count": total_segs_count,
-            "elapsed_str": elapsed_str,
             "last_spoken_words": last_spoken
         }
 
-        # 1. تأمين النسخ الاحتياطية (GitHub Artifacts + Telegram Document + SMTP) قبل لمس Google Drive!
+        # تأمين النسخ الاحتياطية وإرسال الإيميل المباشر والتليغرام قبل لمس Drive
         save_bulletproof_backups(main_html, sum_html, summary_json_data)
 
-        # 2. رفع التقريرين وملف الملخص إلى Google Drive
+        # رفع الملفات للدرايف
         upload_report_to_drive(f"01_Main_Detailed_Report_{CLEAN_NAME}.html", main_html, "text/html")
         upload_report_to_drive(f"02_Summarized_Report_{CLEAN_NAME}.html", sum_html, "text/html")
-        upload_report_to_drive("_run_summary.json", json.dumps(summary_json_data, ensure_ascii=False, indent=2), "application/json")
 
-        # 3. تحديث اسم المجلد ووصفه ليلتقطه Code.gs ويرسل الإيميل لجميع المستخدمين
-        summary_desc = (
-            f"• المنظومة المختارة: {MODE_TITLE}\n"
-            f"• الحساب والنموذج المستخدم: {cost_info['keyLabel']} ({cost_info.get('modelUsed', '')})\n"
-            f"• تكلفة هذه العملية: ${cost_info['processCost']:.4f} (سقف الحلقة المحدد: ${EPISODE_MAX_COST:.2f})\n"
-            f"• إجمالي الإنفاق هذا الشهر: ${cost_info['totalMonthly']:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
-            f"• عدد المقاطع المحللة: {total_segs_count} جزء\n"
-            f"• المدة الإجمالية للحلقة: {exact_duration}\n"
-            f"• الوقت المستغرق: {elapsed_str}\n"
-            f"• آخر كلام نُطق في ختام الحلقة:\n«{last_spoken}»"
+        # تحديث المجلد وإعطاء الإشارة لـ Code.gs مع تمرير التكلفة الصحيحة
+        update_drive_folder_and_summary(
+            FOLDER_ID,
+            f"PROCESSED_{CLEAN_NAME}",
+            cost_info["processCost"],
+            cost_info["totalMonthly"],
+            cost_info.get("modelUsed", ""),
+            "Max",
+            exact_duration,
+            "."
         )
-        update_drive_folder(f"PROCESSED_{CLEAN_NAME}", summary_desc)
 
-        folder_url = f"https://drive.google.com/drive/folders/{FOLDER_ID}"
-        send_telegram(
-            f"✅ تمت المعالجة والتقييم بنجاح!\n"
-            f"📌 الحلقة: {CLEAN_NAME}\n"
-            f"⚙️ المنظومة: {MODE_TITLE}\n"
-            f"🔑 الحساب المستخدم: {cost_info['keyLabel']} ({cost_info.get('modelUsed', '')})\n"
-            f"💵 تكلفة العملية الحالية: ${cost_info['processCost']:.4f} (سقف الحلقة: ${EPISODE_MAX_COST:.2f})\n"
-            f"📊 إجمالي الإنفاق هذا الشهر: ${cost_info['totalMonthly']:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
-            f"⏱️ المدة: {exact_duration} | الاستغراق: {elapsed_str}\n\n"
-            f"🎙️ آخر كلام في الحلقة:\n«{last_spoken}»\n\n"
-            f"📁 رابط المجلد:\n{folder_url}",
-            use_html=False
-        )
+        send_telegram(f"✅ تمت معالجة وتقييم الحلقة بنجاح!\n📌 {CLEAN_NAME}\n💵 التكلفة: ${cost_info['processCost']:.4f}", use_html=False)
     except Exception as e:
-        log_step("❌ توقفت المعالجة بسبب خطأ.")
         error_msg = str(e)
-        current_monthly = get_monthly_spend()
-        fail_summary = {
-            "status": "FAILED",
-            "folder_name": CLEAN_NAME,
-            "mode_title": MODE_TITLE,
-            "process_cost_usd": 0.0,
-            "monthly_spend_usd": current_monthly,
-            "monthly_cap_usd": MAX_MONTHLY_BUDGET,
-            "error_reason": error_msg
-        }
+        log_step(f"❌ خطأ: {error_msg}")
+        fail_summary = {"status": "FAILED", "error_reason": error_msg}
         save_bulletproof_backups(None, None, fail_summary)
-        upload_report_to_drive("_run_summary.json", json.dumps(fail_summary, ensure_ascii=False, indent=2), "application/json")
-
-        fail_desc = (
-            f"• المنظومة المختارة: {MODE_TITLE}\n"
-            f"• إجمالي الإنفاق هذا الشهر: ${current_monthly:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
-            f"• تفاصيل السبب:\n{error_msg[:1500]}"
-        )
-        update_drive_folder(f"FAILED_{CLEAN_NAME}", fail_desc)
-
-        raw_fail_msg = (
-            f"❌ فشل معالجة الحلقة: {CLEAN_NAME}\n"
-            f"⚙️ المنظومة: {MODE_TITLE}\n"
-            f"📊 إجمالي الإنفاق هذا الشهر: ${current_monthly:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
-            f"⚠️ تفاصيل الخطأ:\n{error_msg[:3000]}"
-        )
-        send_telegram(raw_fail_msg, use_html=False)
+        session.patch(f"[https://www.googleapis.com/drive/v3/files/](https://www.googleapis.com/drive/v3/files/){FOLDER_ID}", headers={"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json"}, json={"name": f"FAILED_{CLEAN_NAME}"}, timeout=20)
+        send_telegram(f"❌ فشل المعالجة: {CLEAN_NAME}\nالسبب: {error_msg[:1000]}", use_html=False)
         sys.exit(1)
 
 
