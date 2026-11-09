@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-منظومة تقييم مقدمي البرامج التلفزيونية المحصنة (evaluate.py)
-- مطابقة 100% في الشكل والمعايير والقوالب (90 نقطة - 6 معايير أساسية - 23 معياراً فرعياً - التقرير المفصل + التقرير المختصر).
-- فحص مسبق فوري للحصة والـ Token/Cost على المفاتيح المجانية والمدفوعة قبل رفع أي ملف (Zero Wasted Upload Time).
-- تثبيت قاعدة اللهجة اللبنانية المحكية ضمن التعليمات الإلزامية.
-- تنسيق HTML تنفيذي ملون (Royal Executive RTL Theme) متوافق 100% مع Microsoft Word.
-- تمرير التكلفة الفعلية بدقة إلى _run_summary.json ووصف المجلد والتقرير لمنع ظهور $0.00.
+منظومة تقييم مقدمي البرامج التلفزيونية المحصنة (evaluate.py) - تدعم المنظومة الثانية (موجهة) والمنظومة الثالثة (عامة محايدة):
+- إذا بدأ المجلد بـ READY_GEN_ أو GEN_READY_ (أو تضمن _gen أو _neutral): يشغّل [المنظومة الثالثة: التقييم المهني العام والمحايد بدون خلفية قناة موجهة].
+- إذا بدأ المجلد بـ READY_ العادية: يشغّل [المنظومة الثانية: التقييم مع مراعاة الخط التحريري للقناة الموجهة].
+- فحص لحظي (0.5 ثانية - 1 توكن) للكوتا والميزانية قبل رفع أي ملف لمنع إضاعة الوقت في الرفع المتكرر.
+- تثبيت قاعدة اللهجة اللبنانية المحكية + التصميم التنفيذي الملون (Royal Executive RTL Theme) + النسخ الاحتياطي الرباعي.
 """
 
 import os
@@ -18,7 +17,7 @@ import shutil
 import smtplib
 import subprocess
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -26,24 +25,7 @@ from email import encoders
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-
-def _u(url_str: str) -> str:
-    """تنظيف أي رابط من أقواس Markdown في حال حدوثها أثناء النسخ واللصق"""
-    s = str(url_str).strip()
-    m = re.match(r'^\[[^\]]+\]\((https?://[^)]+)\)(.*)$', s)
-    if m:
-        return m.group(1) + m.group(2)
-    s = re.sub(r'\[([^\]]+)\]\((https?://[^)]+)\)', r'\2', s)
-    return s.strip("[]()")
-
-
-# روابط الـ API المعرفة بشكل آمن ضد التعديل التلقائي
-TG_API_BASE = _u("https://api.telegram.org/bot")
-DRIVE_FILES_API = _u("https://www.googleapis.com/drive/v3/files")
-DRIVE_UPLOAD_API = _u("https://www.googleapis.com/upload/drive/v3/files")
-GEMINI_BASE_API = _u("https://generativelanguage.googleapis.com/v1beta/models")
-GEMINI_UPLOAD_API = _u("https://generativelanguage.googleapis.com/upload/v1beta/files")
+import html
 
 FOLDER_ID = os.environ["FOLDER_ID"].strip()
 CLEAN_NAME = os.environ.get("CLEAN_NAME", "Episode").strip()
@@ -82,6 +64,16 @@ UPPER_NAME = CLEAN_NAME.upper()
 FORCE_FREE = UPPER_NAME.endswith("_FREE") or "_FREE_" in UPPER_NAME
 IS_LOW_MODE = UPPER_NAME.endswith("_LOW") or "_LOW_" in UPPER_NAME
 
+# اكتشاف المنظومة الثالثة (التقييم المهني العام والمحايد - بدون خلفية قناة موجهة)
+IS_GENERAL_NEUTRAL_MODE = bool(
+    UPPER_NAME.startswith("GEN_")
+    or UPPER_NAME.startswith("NEUTRAL_")
+    or "_GEN_" in UPPER_NAME
+    or UPPER_NAME.endswith("_GEN")
+    or "_NEUTRAL_" in UPPER_NAME
+    or UPPER_NAME.endswith("_NEUTRAL")
+)
+
 START_TIME = time.time()
 LOG_LINES = []
 ORIGINAL_SOURCE_URL = None
@@ -93,6 +85,7 @@ SPEND_TRACKER_FILENAME = "_gemini_monthly_spend_tracker.json"
 
 def parse_episode_max_cost(folder_clean_name, default_cap=DEFAULT_MAX_EPISODE_COST):
     upper = folder_clean_name.upper()
+
     m_paid_custom = re.search(r'_PAID_(\d+(?:\.\d+)?)', upper)
     if m_paid_custom:
         val = float(m_paid_custom.group(1))
@@ -121,23 +114,54 @@ def parse_episode_max_cost(folder_clean_name, default_cap=DEFAULT_MAX_EPISODE_CO
 EPISODE_MAX_COST, EPISODE_COST_SOURCE, IS_PAID_MIN_COST = parse_episode_max_cost(CLEAN_NAME)
 FORCE_PAID = ((UPPER_NAME.endswith("_PAID") or "_PAID_" in UPPER_NAME) and not FORCE_FREE)
 
-if FORCE_FREE and IS_LOW_MODE:
-    MODE_TITLE = "المنظومة المجانية الإجبارية الاقتصادية (_LOW_FREE - بدون أي سحب مالي)"
-elif FORCE_FREE:
-    MODE_TITLE = "المنظومة المجانية الإجبارية (_FREE - تتوقف فوراً إذا لم يتوفر رصيد مجاني)"
-elif FORCE_PAID and IS_LOW_MODE:
-    MODE_TITLE = f"المنظومة المدفوعة الاقتصادية (_LOW_PAID - {EPISODE_COST_SOURCE})"
-elif IS_PAID_MIN_COST:
-    MODE_TITLE = f"المنظومة الذكية بأقل تكلفة ممكنة (_PAID - تبدأ بالمجاني ثم الأوفر مالياً | {EPISODE_COST_SOURCE})"
-elif FORCE_PAID:
-    MODE_TITLE = f"المنظومة المدفوعة المتدرجة ({EPISODE_COST_SOURCE} - تختار أعلى نموذج تحت السقف)"
-elif IS_LOW_MODE:
-    MODE_TITLE = f"المنظومة الاقتصادية (_LOW) (صورة كل 5 ثوان) [تبدأ بالمجاني ثم المدفوع | {EPISODE_COST_SOURCE}]"
-else:
-    MODE_TITLE = f"المنظومة الاحترافية المتدرجة (صورة كل ثانية) [تبدأ بالمجاني ثم المدفوع | {EPISODE_COST_SOURCE}]"
+EDITORIAL_TYPE_LABEL = (
+    "المنظومة الثالثة: تقييم مهني إعلامي عام ومحايد (بدون خلفية قناة موجهة)"
+    if IS_GENERAL_NEUTRAL_MODE
+    else "المنظومة الثانية: تقييم مع مراعاة الخط التحريري للقناة الموجهة"
+)
 
-SKILL_INSTRUCTIONS_AND_RUBRIC = """
+if FORCE_FREE and IS_LOW_MODE:
+    MODE_TITLE = f"{EDITORIAL_TYPE_LABEL} | مجاني اقتصادي (_LOW_FREE)"
+elif FORCE_FREE:
+    MODE_TITLE = f"{EDITORIAL_TYPE_LABEL} | مجاني حصري (_FREE)"
+elif FORCE_PAID and IS_LOW_MODE:
+    MODE_TITLE = f"{EDITORIAL_TYPE_LABEL} | مدفوع اقتصادي (_LOW_PAID - {EPISODE_COST_SOURCE})"
+elif IS_PAID_MIN_COST:
+    MODE_TITLE = f"{EDITORIAL_TYPE_LABEL} | أقل تكلفة ممكنة (_PAID | {EPISODE_COST_SOURCE})"
+elif FORCE_PAID:
+    MODE_TITLE = f"{EDITORIAL_TYPE_LABEL} | مدفوع متدرج ({EPISODE_COST_SOURCE})"
+elif IS_LOW_MODE:
+    MODE_TITLE = f"{EDITORIAL_TYPE_LABEL} | اقتصادي (_LOW | {EPISODE_COST_SOURCE})"
+else:
+    MODE_TITLE = f"{EDITORIAL_TYPE_LABEL} | احترافي متدرج ({EPISODE_COST_SOURCE})"
+
+# ==============================================================================
+# البند الثالث المتغير حسب نوع المنظومة (المنظومة الثانية الموجهة vs المنظومة الثالثة العامة)
+# ==============================================================================
+EDITORIAL_RULE_DIRECTED = """3. مراعاة الخط التحريري وسياق القناة (قاعدة جوهرية لا يجوز مخالفتها):
+   - يُجرى التقييم مع الأخذ في الحسبان الهوية التحريرية للقناة (إعلام داعم ومتبنٍّ لخط المقاومة).
+   - يُمنع منعاً باتاً خصم علامات أو انتقاد المقدم بسبب تبنيه لخط المقاومة أو استخدامه مصطلحاتها (مثل: كيان العدو، المقاومة، الشهيد، الاعتداءات الإسرائيلية) أو عدم لعبه دور "المحايد" تجاه العدو؛ فهذا التزام طبيعي بالسياسة التحريرية للقناة وليس عيباً مهنياً.
+   - التمايز بين "المونولوج العبثي" و"التوظيف التحريري الهادف": إذا كان الضيف حليفاً وفي مسار تفكيك لسرديات خصوم المقاومة، فإن ترك المساحة له قد يكون قراراً تحريرياً مقصوداً.
+   - حدود التوظيف التحريري: المونولوج الذي يتجاوز 3 دقائق متصلة دون أي مقاطعة وظيفية أو سؤال تلخيصي أو توجيهي من المقدم يُعد فشلاً تقنياً في إدارة الإيقاع التلفزيوني (Broken TV Rhythm)، ويجب المحاسبة عليه بخصم النقاط في معايير "التعامل مع الضيف"، "المتابعة والتعقيب"، و"ضبط الوقت".
+   - في معيار "الاختصار والحياد وتجنب تعدد الأسئلة"، يُقصد بالحياد المهني هنا: عدم مصادرة رأي الضيف بمقدمات تقريرية مطولة تفرض عليه الإجابة، وليس الحياد السياسي تجاه العدو."""
+
+EDITORIAL_RULE_GENERAL_NEUTRAL = """3. المعيار المهني الإعلامي العام والحياد الحواري (تقييم غير موجّه - بدون خلفية قناة موجهة):
+   - يُجرى التقييم وفق المعايير المهنية التلفزيونية العامة والمستقلة، دون افتراض وجود خط أيديولوجي أو سياسي موجّه للقناة، ودون منح أي استثناء أيديولوجي للمقدم أو الضيف.
+   - يُحاسب المقدم مهنياً على التزامه بمبدأ المسافة المهنية الواحدة، وعدم الانحياز الشخصي أو تبني سردية الضيف أو التسليم بمقدماته دون تمحيص.
+   - يُطلب من المقدم لعب دور "المحاور المسائل والمدقق" (Critical Interviewer) مع جميع الضيوف بلا استثناء؛ فيُحاسب على مدى مواجهته للضيف بالأسئلة الاستقصائية والتدقيق في التناقضات ومقاطعته مهنياً عند التهرب من السؤال أو إلقاء سرديات إنشائية.
+   - أي استرسال أو مونولوج للضيف يتجاوز دقيقتين إلى 3 دقائق متصلة دون مقاطعة وظيفية أو توجيه أو استجواب من المقدم يُعدّ ضعفاً تقنياً ومهنياً في السيطرة على الاستوديو وإدارة الإيقاع التلفزيوني، ويُحاسب عليه بصرامة في معايير "التعامل مع الضيف"، "المتابعة والتعقيب"، و"ضبط الوقت".
+   - في معيار "الاختصار والحياد وتجنب تعدد الأسئلة"، يُقصد بالحياد المهني: الحياد الكامل في صياغة السؤال (عدم تضمين السؤال أحكاماً مسبقة أو مقدمات توجيهية منحازة أو مصادرة لإجابة الضيف)."""
+
+SELECTED_EDITORIAL_RULE = EDITORIAL_RULE_GENERAL_NEUTRAL if IS_GENERAL_NEUTRAL_MODE else EDITORIAL_RULE_DIRECTED
+METHODOLOGY_TEXT_NOTE = (
+    "التقييم مهني وتقني مستقل وفق المعايير الإعلامية العامة والحياد الحواري (بدون خلفية قناة موجهة) مع مراعاة قاعدة المزاوجة اللغوية المحببة باللهجة اللبنانية"
+    if IS_GENERAL_NEUTRAL_MODE
+    else "التقييم مهني وتقني مع مراعاة الخط التحريري للقناة وقاعدة المزاوجة اللغوية المحببة باللهجة اللبنانية"
+)
+
+SKILL_INSTRUCTIONS_AND_RUBRIC = f"""
 أنت خبير متخصص في تقييم الأداء المهني والتلفزيوني لمقدمي البرامج السياسية والحوارية وفق السلم المعتمد (90 نقطة).
+نوع التقييم المطلوب في هذه الحلقة: [{EDITORIAL_TYPE_LABEL}].
 يجب عليك الالتزام الحرفي والصارم بنسبة 100% بجميع القواعد والمعايير والقوالب التالية دون أي اختصار أو اجتهاد خارجها:
 
 ================================================================================
@@ -152,22 +176,16 @@ SKILL_INSTRUCTIONS_AND_RUBRIC = """
    - يجب تحليل الحلقة بالكامل من الثانية الأولى (00:00:00) وحتى آخر ثانية في المقطع الأخير دون أي انقطاع أو قفز أو أخذ عينات.
    - التوقيت يكتب بصيغة واضحة ومتصلة من بداية الحلقة: `من 00:08:24 إلى 00:08:28` لمنع الانعكاس في RTL. ممنوع نهائياً كتابة "الجزء الأول" أو "المقطع الثاني".
 
-3. مراعاة الخط التحريري وسياق القناة (قاعدة جوهرية لا يجوز مخالفتها):
-   - يُجرى التقييم مع الأخذ في الحسبان الهوية التحريرية للقناة (إعلام داعم ومتبنٍّ لخط المقاومة).
-   - يُمنع منعاً باتاً خصم علامات أو انتقاد المقدم بسبب تبنيه لخط المقاومة أو استخدامه مصطلحاتها (مثل: كيان العدو، المقاومة، الشهيد، الاعتداءات الإسرائيلية) أو عدم لعبه دور "المحايد" تجاه العدو؛ فهذا التزام طبيعي بالسياسة التحريرية للقناة وليس عيباً مهنياً.
-   - التمايز بين "المونولوج العبثي" و"التوظيف التحريري الهادف": إذا كان الضيف حليفاً وفي مسار تفكيك لسرديات خصوم المقاومة، فإن ترك المساحة له قد يكون قراراً تحريرياً مقصوداً.
-   - حدود التوظيف التحريري: المونولوج الذي يتجاوز 3 دقائق متصلة دون أي مقاطعة وظيفية أو سؤال تلخيصي أو توجيهي من المقدم يُعد فشلاً تقنياً في إدارة الإيقاع التلفزيوني (Broken TV Rhythm)، ويجب المحاسبة عليه بخصم النقاط في معايير "التعامل مع الضيف"، "المتابعة والتعقيب"، و"ضبط الوقت".
-   - في معيار "الاختصار والحياد وتجنب تعدد الأسئلة"، يُقصد بالحياد المهني هنا: عدم مصادرة رأي الضيف بمقدمات تقريرية مطولة تفرض عليه الإجابة، وليس الحياد السياسي تجاه العدو.
+{SELECTED_EDITORIAL_RULE}
 
-4. قاعدة اللهجة اللبنانية المحكية والمزاوجة اللغوية (قاعدة جوهرية إلزامية):
-   - استخدام المقدم للهجة العامية اللبنانية الطبيعية أو تطعيم الحوار بها ليس أمراً سلبياً على الإطلاق، ويُمنع منعاً باتاً خصم أي علامة بسببه في أي معيار.
-   - يُمنع منعاً باتاً إدراج "استخدام العامية أو اللهجة اللبنانية" ضمن نقاط الضعف أو "أولويات التطوير" أو المآخذ السلبية.
-   - التطعيم المتوازن باللهجة اللبنانية المحكية يُفسَّر كأسلوب تواصلي إيجابي ومحبب يكسر الجمود والرتابة ("البيئة الناشفة" للفصحى الصرفة) ويقرب المقدم من المشاهد.
-   - في معيار "اللغة والطلاقة (2 نقطة)"، تقتصر المحاسبة حصراً على: التلعثم، التردد المربك، مخارج الحروف، أو الأخطاء النحوية واللغوية الصريحة المرتكبة أثناء التحدث باللغة العربية الفصحى.
+4. قاعدة اللهجة اللبنانية المحكية والمزاوجة اللغوية (قاعدة إلزامية صارمة لا يجوز مخالفتها):
+   - استخدام اللهجة العامية اللبنانية في الحوار ليس أمراً سلبياً إطلاقاً: يُمنع منعاً باتاً خصم أي علامة أو توجيه أي انتقاد سلبي أو إدراج ضمن "أولويات التطوير" بسبب استخدام المقدم لعبارات أو أسئلة أو مداخلات باللهجة اللبنانية المحكية أثناء الحوار.
+   - التطعيم المتوازن باللهجة اللبنانية المحكية يُعتبر أسلوباً تواصلياً محبباً وطبيعياً يكسر الجمود والرتابة ("البيئة الناشفة" للفصحى الصرفة) ويخلق جاذبية وقرباً من المشاهد.
+   - في معيار "اللغة والطلاقة (2 نقطة)"، تقتصر المحاسبة حصراً على: سلامة النطق ومخارج الحروف، طلاقة اللسان وعدم التلعثم أو التردد المربك، وتجنب الأخطاء النحوية أو اللغوية الفادحة عند التحدث بالفصحى.
 
 5. العمق التحليلي والشواهد الحية الموثقة (إلزامي في التقرير المفصل):
    - يُمنع منعاً باتاً الاكتفاء بعبارات عامة أو ملخصات قصيرة! يجب أن تكون الملاحظات المهنية داخل الجداول غنية، ناقدة، ومفصلة، ومدعومة بـ:
-     أ) اقتباسات نصية حرفية (Verbatim Quotes) من كلام المقدم مع توقيتها الدقيق (مثلاً: رصد العثرات اللفظية، صياغة الأسئلة الطويلة/المركبة، أو الأسئلة التتبعية الذكية).
+     أ) اقتباسات نصية حرفية (Verbatim Quotes) من كلام المقدم مع توقيتها الدقيق (مثلاً: صياغة الأسئلة الطويلة/المركبة، الأسئلة التتبعية الذكية، المقاطعات الوظيفية، أو التلعثم اللغوي إن وجد).
      ب) رصد بصري دقيق للغة الجسد والحضور التلفزيوني من ملفات الفيديو مع التوقيت الدقيق بالثانية (مثل: استقامة الجلسة، توزيع النظرات بين الضيف والكاميرا، حركة اليدين، العادات الحركية السلبية كلمس الوجه أو الذقن أو العبث باللحية، التلويح بالقلم، وتعابير الوجه أثناء الإصغاء).
      ج) تحليل دقيق لإدارة الوقت والانتقالات بين ضيوف الاستوديو والمراسلين الميدانيين أو التقارير المسجلة (VT).
 
@@ -215,23 +233,28 @@ SKILL_INSTRUCTIONS_AND_RUBRIC = """
 (قاعدة العلامة: لا تجعل الانطباع العام يسبق الأدلة. الأدلة ← التصنيف ← العلامة. يجب أن يتطابق مجموع العلامات الفرعية مع علامة كل معيار أساسي، ومجموع المعايير الستة مع العلامة الإجمالية من 90).
 
 ================================================================================
-ثالثاً: القالب الإلزامي الحرفي لمخرجات الـ HTML (template.md)
+ثالثاً: القالب الإلزامي الحرفي لمخرجات الـ HTML (Royal Executive Theme)
 ================================================================================
-1. يجب أن يحتوي حقل `mainDetailedHtml` على كود HTML الكامل لـ "التقرير الرئيسي المفصل" مطابقاً تماماً لهذا الهيكل وجميع جداوله الـ 6 الفرعية وجدول الأمثلة الموثقة (10 أمثلة على الأقل موزعة على كامل الحلقة):
+1. يجب أن يحتوي حقل `mainDetailedHtml` على كود HTML الكامل لـ "التقرير الرئيسي المفصل" مطابقاً تماماً لهذا الهيكل وجميع فئات التنسيق الملونة (`header-banner`, `exec-box`, `summary-strip`, `core-grid`, `score-cell`, `strengths-box`, `priorities-box`):
 
-<h1>تقييم تفصيلي وفق المعايير الموسعة</h1>
-<div class="subtitle">[اسم المقدم] - [الشهر والسنة / عنوان الحلقة]</div>
+<div class="header-banner">
+    <h1>تقييم تفصيلي وفق المعايير الموسعة</h1>
+    <div class="subtitle">[اسم المقدم] - [الشهر والسنة / عنوان الحلقة]</div>
+</div>
 
 <table class="info-table">
     <tr><td>المقدم</td><td>[اسم المقدم]</td></tr>
     <tr><td>الحلقة</td><td>[نوع الحلقة / البرنامج - التاريخ]</td></tr>
+    <tr><td>معيار التقييم</td><td>{EDITORIAL_TYPE_LABEL}</td></tr>
     <tr><td>الضيوف</td><td>[أسماء الضيوف والمراسلين وطريقة المشاركة: استديو / Zoom / مداخلة ميدانية]</td></tr>
     <tr><td>المادة المسجلة</td><td>[تفاصيل التقارير VT أو المداخلات وتوقيتها من 00:00:00 إلى 00:00:00 أو لا يوجد]</td></tr>
     <tr><td>مدة الحلقة</td><td>[المدة الدقيقة الكاملة بالثواني والدقائق - مع تأكيد تحليلها بالكامل]</td></tr>
 </table>
 
 <h2>الخلاصة التنفيذية</h2>
-<p>[فقرة تحليلية مكثفة ومعمقة من 5-8 أسطر تلخص المستوى العام للمقدم في الحلقة، أبرز ملامح الأداء في إدارة الحوار والأسئلة والمتابعة والحضور البصري واللغوي، ونقطة الضعف أو الاستنزاف الزمني الأساسية]</p>
+<div class="exec-box">
+    <p>[فقرة تحليلية مكثفة ومعمقة من 5-8 أسطر تلخص المستوى العام للمقدم في الحلقة، أبرز ملامح الأداء في إدارة الحوار والأسئلة والمتابعة والحضور البصري واللغوي، ونقطة الضعف أو الاستنزاف الزمني الأساسية]</p>
+</div>
 
 <table class="summary-strip">
     <tr>
@@ -243,7 +266,7 @@ SKILL_INSTRUCTIONS_AND_RUBRIC = """
 </table>
 
 <h2>منهج التقييم</h2>
-<p>تم تطبيق السلم المعتمد: إدارة الحلقة 20، التعامل مع الضيف 20، جودة الأسئلة 20، المتابعة والتعقيب 15، الحضور والأداء 10، وضبط الوقت 5. التقييم مهني وتقني مع مراعاة الخط التحريري، وجرى استخدام التفريغ الموقّت والفيديو للتحقق من الانتقالات والحضور البصري على كامل مدة الحلقة.</p>
+<p>تم تطبيق السلم المعتمد: إدارة الحلقة 20، التعامل مع الضيف 20، جودة الأسئلة 20، المتابعة والتعقيب 15، الحضور والأداء 10، وضبط الوقت 5. {METHODOLOGY_TEXT_NOTE}، وجرى استخدام التفريغ الموقّت والفيديو للتحقق من الانتقالات والحضور البصري على كامل مدة الحلقة.</p>
 
 <h2>العلامات الأساسية</h2>
 <table class="core-grid">
@@ -262,132 +285,152 @@ SKILL_INSTRUCTIONS_AND_RUBRIC = """
 <h2>1. إدارة الحلقة - [ ]/20</h2>
 <table>
     <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>بناء وتسلسل الملفات</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>إغلاق الملف والانتقال</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>السيطرة على المسار والمرونة</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>الافتتاح والخاتمة</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>بناء وتسلسل الملفات</td><td class="score-cell">[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>إغلاق الملف والانتقال</td><td class="score-cell">[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>السيطرة على المسار والمرونة</td><td class="score-cell">[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>الافتتاح والخاتمة</td><td class="score-cell">[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
 </table>
 
 <h2>2. التعامل مع الضيف - [ ]/20</h2>
 <table>
     <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>الإصغاء واحترام الجواب</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>توزيع المساحة وعدم المقاطعة غير الضرورية</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>المقاطعة الضرورية ومواجهة الضيف</td><td>[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>احتواء المونولوج وإعادة المسار</td><td>[ ]/5</td><td>[تحليل مفصل مع تطبيق قاعدة الـ 3 دقائق والخط التحريري بالتوقيتات]</td></tr>
+    <tr><td>الإصغاء واحترام الجواب</td><td class="score-cell">[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>توزيع المساحة وعدم المقاطعة غير الضرورية</td><td class="score-cell">[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>المقاطعة الضرورية ومواجهة الضيف</td><td class="score-cell">[ ]/5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>احتواء المونولوج وإعادة المسار</td><td class="score-cell">[ ]/5</td><td>[تحليل مفصل بالتوقيتات]</td></tr>
 </table>
 
 <h2>3. جودة الأسئلة - [ ]/20</h2>
 <table>
     <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>وضوح السؤال</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>دقة السؤال</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>عمق السؤال</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>الارتباط بالمحور</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>الاختصار والحياد وتجنب تعدد الأسئلة</td><td>[ ]/4</td><td>[تحليل طول الأسئلة والأسئلة المركبة مع ذكر مدتها وتوقيتها واقتباسها]</td></tr>
+    <tr><td>وضوح السؤال</td><td class="score-cell">[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>دقة السؤال</td><td class="score-cell">[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>عمق السؤال</td><td class="score-cell">[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>الارتباط بالمحور</td><td class="score-cell">[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>الاختصار والحياد وتجنب تعدد الأسئلة</td><td class="score-cell">[ ]/4</td><td>[تحليل طول الأسئلة والحياد والأسئلة المركبة مع ذكر مدتها وتوقيتها واقتباسها]</td></tr>
 </table>
 
 <h2>4. المتابعة والتعقيب - [ ]/15</h2>
 <table>
     <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>المتابعة المبنية على الجواب</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>التقاط النقاط المهمة والتناقضات</td><td>[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>طلب التوضيح والتحقق</td><td>[ ]/3.5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
-    <tr><td>بناء السؤال التالي من الجواب</td><td>[ ]/3.5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>المتابعة المبنية على الجواب</td><td class="score-cell">[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>التقاط النقاط المهمة والتناقضات</td><td class="score-cell">[ ]/4</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>طلب التوضيح والتحقق</td><td class="score-cell">[ ]/3.5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
+    <tr><td>بناء السؤال التالي من الجواب</td><td class="score-cell">[ ]/3.5</td><td>[تحليل مفصل مدعوم بالشواهد والتوقيتات]</td></tr>
 </table>
 
 <h2>5. الحضور والأداء - [ ]/10</h2>
 <table>
     <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>الجاذبية التلفزيونية</td><td>[ ]/3</td><td>[تحليل مفصل للهيئة والحضور والاتزان على الشاشة]</td></tr>
-    <tr><td>لغة الجسد والتواصل البصري</td><td>[ ]/2.5</td><td>[رصد بصري دقيق بالتوقيتات لحركة اليدين، النظرات، لمس الوجه/اللحية، استخدام القلم، والجلسة]</td></tr>
-    <tr><td>الصوت والإلقاء</td><td>[ ]/2.5</td><td>[تحليل الخامة الصوتية، التنغيم، مخارج الحروف، والنفس بالتوقيتات]</td></tr>
-    <tr><td>اللغة والطلاقة</td><td>[ ]/2</td><td>[رصد سلامة الفصحى أو التلعثم مع تطبيق قاعدة اللهجة اللبنانية المحكية الإيجابية وإيراد اقتباسات حرفية بالتوقيتات]</td></tr>
+    <tr><td>الجاذبية التلفزيونية</td><td class="score-cell">[ ]/3</td><td>[تحليل مفصل للهيئة والحضور والاتزان على الشاشة]</td></tr>
+    <tr><td>لغة الجسد والتواصل البصري</td><td class="score-cell">[ ]/2.5</td><td>[رصد بصري دقيق بالتوقيتات لحركة اليدين، النظرات، لمس الوجه/اللحية، استخدام القلم، والجلسة]</td></tr>
+    <tr><td>الصوت والإلقاء</td><td class="score-cell">[ ]/2.5</td><td>[تحليل الخامة الصوتية، التنغيم، مخارج الحروف، والنفس بالتوقيتات]</td></tr>
+    <tr><td>اللغة والطلاقة</td><td class="score-cell">[ ]/2</td><td>[تقييم سلامة الفصحى وطلاقة اللسان ومرونة المزاوجة التواصلية المحببة باللهجة اللبنانية المحكية التي تكسر الجمود، مع المحاسبة فقط على التلعثم أو الأخطاء النحوية الفادحة عند التحدث بالفصحى بالتوقيتات]</td></tr>
 </table>
 
 <h2>6. ضبط الوقت - [ ]/5</h2>
 <table>
     <tr><th style="width: 25%;">المعيار الفرعي</th><th style="width: 10%;">العلامة</th><th style="width: 65%;">الملاحظة المهنية والشواهد الموثقة</th></tr>
-    <tr><td>توزيع الوقت بين الملفات والضيوف</td><td>[ ]/1.7</td><td>[تحليل مفصل لتوزيع الزمن بين المحاور والضيوف والمراسلين]</td></tr>
-    <tr><td>منع استنزاف الوقت في نقطة واحدة</td><td>[ ]/1.6</td><td>[تحليل مفصل مدعوم بالتوقيتات]</td></tr>
-    <tr><td>إنهاء المحاور والخاتمة</td><td>[ ]/1.7</td><td>[تحليل دقة إغلاق الحلقة في التوقيت الختامي]</td></tr>
+    <tr><td>توزيع الوقت بين الملفات والضيوف</td><td class="score-cell">[ ]/1.7</td><td>[تحليل مفصل لتوزيع الزمن بين المحاور والضيوف والمراسلين]</td></tr>
+    <tr><td>منع استنزاف الوقت في نقطة واحدة</td><td class="score-cell">[ ]/1.6</td><td>[تحليل مفصل مدعوم بالتوقيتات]</td></tr>
+    <tr><td>إنهاء المحاور والخاتمة</td><td class="score-cell">[ ]/1.7</td><td>[تحليل دقة إغلاق الحلقة في التوقيت الختامي]</td></tr>
 </table>
 
 <h2>أمثلة موثقة من الحلقة</h2>
 <table>
     <tr><th style="width: 22%;">التوقيت</th><th style="width: 33%;">المثال (اقتباس حرفي أو رصد بصري)</th><th style="width: 45%;">الدلالة المهنية</th></tr>
     <tr><td>من 00:00:00 إلى 00:00:00</td><td>[وصف الموقف أو الاقتباس الحرفي]</td><td>[تحليل الدلالة المهنية إيجاباً أو سلباً وربطها بالمعيار]</td></tr>
-    <!-- أدرج ما لاقف عن 10 أمثلة موثقة موزعة على كامل مدة الحلقة من بدايتها لختامها -->
+    <!-- أدرج ما لا يقل عن 10 أمثلة موثقة موزعة على كامل مدة الحلقة من بدايتها لختامها -->
 </table>
 
 <h2>نقاط القوة الرئيسية</h2>
-<ul>
-    <li>[نقطة قوة مفصلة 1 مع التوقيت]</li>
-    <li>[نقطة قوة مفصلة 2 مع التوقيت]</li>
-    <li>[نقطة قوة مفصلة 3 مع التوقيت]</li>
-    <li>[نقطة قوة مفصلة 4 مع التوقيت]</li>
-</ul>
+<div class="strengths-box">
+    <ul>
+        <li>[نقطة قوة مفصلة 1 مع التوقيت]</li>
+        <li>[نقطة قوة مفصلة 2 مع التوقيت]</li>
+        <li>[نقطة قوة مفصلة 3 مع التوقيت]</li>
+        <li>[نقطة قوة مفصلة 4 مع التوقيت]</li>
+    </ul>
+</div>
 
 <h2>أولويات التطوير</h2>
-<ul>
-    <li>[أولوية تطوير عملية 1 مع الشاهد الزمني]</li>
-    <li>[أولوية تطوير عملية 2 مع الشاهد الزمني]</li>
-    <li>[أولوية تطوير عملية 3 مع الشاهد الزمني]</li>
-    <li>[أولوية تطوير عملية 4 مع الشاهد الزمني]</li>
-</ul>
+<div class="priorities-box">
+    <ul>
+        <li>[أولوية تطوير عملية 1 مع الشاهد الزمني - يُمنع إدراج اللهجة اللبنانية المحكية كعيب أو أولوية تطوير]</li>
+        <li>[أولوية تطوير عملية 2 مع الشاهد الزمني]</li>
+        <li>[أولوية تطوير عملية 3 مع الشاهد الزمني]</li>
+        <li>[أولوية تطوير عملية 4 مع الشاهد الزمني]</li>
+    </ul>
+</div>
 
 <h2>الخلاصة النهائية</h2>
-<p>العلامة الحالية: [ ] من 90 ([ ]%). [فقرة ختامية مركزة تلخص مستوى الأداء العام والخطوة التطويرية الأهم لرفع العلامة مستقبلاً].</p>
+<div class="exec-box">
+    <p>العلامة الحالية: [ ] من 90 ([ ]%). [فقرة ختامية مركزة تلخص مستوى الأداء العام والخطوة التطويرية الأهم لرفع العلامة مستقبلاً].</p>
+</div>
 
 ---
-2. ويجب أن يحتوي حقل `summarizedHtml` على كود HTML الكامل لـ "التقرير المختصر" مطابقاً تماماً لهذا الهيكل:
+2. ويجب أن يحتوي حقل `summarizedHtml` على كود HTML الكامل لـ "التقرير المختصر" مطابقاً تماماً لهذا الهيكل الملون:
 
-<h1>نموذج تقييم أداء مقدم/ة برنامج (تقرير مختصر)</h1>
+<div class="header-banner">
+    <h1>نموذج تقييم أداء مقدم/ة برنامج (تقرير مختصر)</h1>
+    <div class="subtitle">[اسم المقدم/ة] - [البرنامج / التاريخ]</div>
+</div>
+
 <table class="info-table">
     <tr><td>اسم المقدم/ة</td><td>[اسم المقدم/ة]</td></tr>
     <tr><td>التاريخ</td><td>[التاريخ]</td></tr>
     <tr><td>البرنامج / نوع الحلقة</td><td>[البرنامج / نوع الحلقة]</td></tr>
+    <tr><td>معيار التقييم</td><td>{EDITORIAL_TYPE_LABEL}</td></tr>
     <tr><td>الضيوف والمشاركون</td><td>[الضيوف والمشاركون]</td></tr>
     <tr><td>المواد المسجلة</td><td>[المواد المسجلة]</td></tr>
     <tr><td>مدة الحلقة</td><td>[مدة الحلقة]</td></tr>
 </table>
 
 <h2>الخلاصة التنفيذية</h2>
-<p>[الخلاصة التنفيذية]</p>
+<div class="exec-box">
+    <p>[الخلاصة التنفيذية]</p>
+</div>
 
 <h2>النتيجة الإجمالية</h2>
-<table>
-    <tr><th style="width: 25%;">العلامة</th><th style="width: 20%;">النسبة</th><th style="width: 55%;">التوصيف المختصر</th></tr>
-    <tr><td><strong>[ ] من 90</strong></td><td><strong>[ ]%</strong></td><td>[التوصيف المختصر]</td></tr>
+<table class="summary-strip">
+    <tr>
+        <td style="width: 25%;"><span class="label">العلامة الإجمالية</span><span class="val">[ ] من 90</span></td>
+        <td style="width: 25%;"><span class="label">النسبة المئوية</span><span class="val">[ ]%</span></td>
+        <td style="width: 50%;" colspan="2"><span class="label">التوصيف التنفيذي المختصر</span><span class="val" style="font-size: 11.5pt;">[التوصيف المختصر]</span></td>
+    </tr>
 </table>
 
 <h2>العلامات الأساسية</h2>
 <table>
     <tr><th style="width: 25%;">المعيار</th><th style="width: 15%;">العلامة</th><th style="width: 60%;">ملاحظة مختصرة</th></tr>
-    <tr><td>إدارة الحلقة</td><td>[ ] من 20</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>التعامل مع الضيف</td><td>[ ] من 20</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>جودة الأسئلة</td><td>[ ] من 20</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>المتابعة والتعقيب</td><td>[ ] من 15</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>الحضور والأداء</td><td>[ ] من 10</td><td>[ملاحظة مختصرة]</td></tr>
-    <tr><td>ضبط الوقت</td><td>[ ] من 5</td><td>[ملاحظة مختصرة]</td></tr>
+    <tr><td><b>إدارة الحلقة</b></td><td class="score-cell">[ ] من 20</td><td>[ملاحظة مختصرة]</td></tr>
+    <tr><td><b>التعامل مع الضيف</b></td><td class="score-cell">[ ] من 20</td><td>[ملاحظة مختصرة]</td></tr>
+    <tr><td><b>جودة الأسئلة</b></td><td class="score-cell">[ ] من 20</td><td>[ملاحظة مختصرة]</td></tr>
+    <tr><td><b>المتابعة والتعقيب</b></td><td class="score-cell">[ ] من 15</td><td>[ملاحظة مختصرة]</td></tr>
+    <tr><td><b>الحضور والأداء</b></td><td class="score-cell">[ ] من 10</td><td>[ملاحظة مختصرة]</td></tr>
+    <tr><td><b>ضبط الوقت</b></td><td class="score-cell">[ ] من 5</td><td>[ملاحظة مختصرة]</td></tr>
     <tr style="font-weight: bold; background-color: #DBEAFE;">
-        <td>المجموع الكلي</td><td>[ ] من 90</td><td>[خلاصة عامة]</td>
+        <td><b>المجموع الكلي</b></td><td class="score-cell" style="font-size: 13pt;">[ ] من 90</td><td><b>[خلاصة عامة]</b></td>
     </tr>
 </table>
 
 <h2>نقاط القوة الرئيسية</h2>
-<ul>
-    <li>[نقطة قوة 1]</li>
-    <li>[نقطة قوة 2]</li>
-    <li>[نقطة قوة 3]</li>
-</ul>
+<div class="strengths-box">
+    <ul>
+        <li>[نقطة قوة 1]</li>
+        <li>[نقطة قوة 2]</li>
+        <li>[نقطة قوة 3]</li>
+    </ul>
+</div>
 
 <h2>أولويات التطوير</h2>
-<ul>
-    <li>[أولوية تطوير 1]</li>
-    <li>[أولوية تطوير 2]</li>
-    <li>[أولوية تطوير 3]</li>
-</ul>
+<div class="priorities-box">
+    <ul>
+        <li>[أولوية تطوير 1 - يُمنع إدراج اللهجة اللبنانية المحكية كعيب]</li>
+        <li>[أولوية تطوير 2]</li>
+        <li>[أولوية تطوير 3]</li>
+    </ul>
+</div>
 """
 
 
@@ -400,7 +443,7 @@ def send_telegram(message, use_html=False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        url = _u(f"{TG_API_BASE}{TELEGRAM_BOT_TOKEN}/sendMessage")
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message[:4000],
@@ -422,7 +465,7 @@ def send_telegram(message, use_html=False):
 def send_telegram_document(file_path, caption=""):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not os.path.exists(file_path):
         return False
-    url = _u(f"{TG_API_BASE}{TELEGRAM_BOT_TOKEN}/sendDocument")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
     for attempt in range(3):
         try:
             with open(file_path, "rb") as f:
@@ -449,17 +492,17 @@ def send_direct_smtp_email(subject, html_body, attachment_paths=None):
     if not smtp_user or not smtp_pass or not recipients_raw:
         return False
 
-    recipients = [r.strip() for r in re.split(r"[,;]", recipients_raw) if r.strip() and "@" in r]
-    if smtp_user not in recipients:
-        recipients.append(smtp_user)
+    recipients = [r.strip() for r in re.split(r"[,;]", recipients_raw) if r.strip()]
+    if smtp_user and smtp_user not in recipients:
+        recipients.insert(0, smtp_user)
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
             server.login(smtp_user, smtp_pass)
-            for rcpt in recipients:
+            for rec in recipients:
                 msg = MIMEMultipart()
                 msg["From"] = smtp_user
-                msg["To"] = rcpt
+                msg["To"] = rec
                 msg["Subject"] = subject
                 msg.attach(MIMEText(html_body, "html", "utf-8"))
                 for path in (attachment_paths or []):
@@ -470,8 +513,8 @@ def send_direct_smtp_email(subject, html_body, attachment_paths=None):
                         encoders.encode_base64(part)
                         part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
                         msg.attach(part)
-                server.sendmail(smtp_user, [rcpt], msg.as_string())
-        print(f"✅ تم إرسال الإيميل المباشر عبر SMTP بشكل فردي إلى: {recipients}", flush=True)
+                server.sendmail(smtp_user, [rec], msg.as_string())
+        print(f"✅ تم إرسال الإيميل المباشر عبر SMTP فردياً إلى: {recipients}", flush=True)
         return True
     except Exception as e:
         print(f"⚠️ ملاحظة SMTP المباشر: {e}", flush=True)
@@ -495,8 +538,8 @@ def save_bulletproof_backups(main_html_str, sum_html_str, summary_dict):
             json.dump(summary_dict, f3, ensure_ascii=False, indent=2)
 
     if main_html_str and sum_html_str:
-        cost_val = float(summary_dict.get("processCost", summary_dict.get("process_cost_usd", 0.0)))
-        cap_base = f"📎 نسخة احتياطية فورية ({CLEAN_NAME}) | التكلفة: ${cost_val:.4f}"
+        cost_val = float(summary_dict.get("process_cost_usd", summary_dict.get("processCost", 0.0)))
+        cap_base = f"📎 نسخة احتياطية فورية ({CLEAN_NAME}) | {EDITORIAL_TYPE_LABEL} | التكلفة: ${cost_val:.4f}"
         send_telegram_document(main_path, caption=cap_base + " - التقرير التفصيلي (90 نقطة)")
         send_telegram_document(sum_path, caption=cap_base + " - التقرير المختصر")
         send_direct_smtp_email(
@@ -518,7 +561,7 @@ def log_step(msg):
         try:
             headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "text/plain; charset=utf-8"}
             session.patch(
-                _u(f"{DRIVE_UPLOAD_API}/{LOG_FILE_ID}?uploadType=media"),
+                f"https://www.googleapis.com/upload/drive/v3/files/{LOG_FILE_ID}?uploadType=media",
                 headers=headers,
                 data="\n".join(LOG_LINES).encode("utf-8"),
                 timeout=20
@@ -527,11 +570,14 @@ def log_step(msg):
             pass
 
 
+# ==============================================================================
+# إدارة وحفظ ميزانية الـ 5$ الشهرية بشكل دائم على Google Drive
+# ==============================================================================
 def _find_spend_tracker_file_id():
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
     q = f"name = '{SPEND_TRACKER_FILENAME}' and trashed = false"
     res = session.get(
-        DRIVE_FILES_API,
+        "https://www.googleapis.com/drive/v3/files",
         headers=headers,
         params={"q": q, "fields": "files(id, name)", "pageSize": 1},
         timeout=20
@@ -551,7 +597,7 @@ def get_monthly_spend():
             return 0.0
         headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
         res = session.get(
-            _u(f"{DRIVE_FILES_API}/{file_id}?alt=media"),
+            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
             headers=headers,
             timeout=20
         )
@@ -579,7 +625,7 @@ def add_monthly_spend(amount):
         if file_id:
             headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json; charset=utf-8"}
             session.patch(
-                _u(f"{DRIVE_UPLOAD_API}/{file_id}?uploadType=media"),
+                f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media",
                 headers=headers,
                 data=payload_bytes,
                 timeout=20
@@ -598,7 +644,7 @@ def add_monthly_spend(amount):
             ).encode("utf-8")
             headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"multipart/related; boundary={boundary}"}
             session.post(
-                _u(f"{DRIVE_UPLOAD_API}?uploadType=multipart"),
+                "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
                 headers=headers,
                 data=body,
                 timeout=30
@@ -628,26 +674,6 @@ def calculate_call_cost(model_name, usage_metadata):
     return max(cost, 0.0001)
 
 
-def count_input_tokens_pre_flight(model_name, system_prompt, contents, api_key, fallback_duration_sec=3600.0):
-    url = _u(f"{GEMINI_BASE_API}/{model_name}:countTokens?key={api_key}")
-    payload = {
-        "generateContentRequest": {
-            "model": f"models/{model_name}",
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": contents
-        }
-    }
-    try:
-        res = session.post(url, json=payload, timeout=30)
-        if res.status_code == 200:
-            total_t = int(res.json().get("totalTokens", 0) or 0)
-            if total_t > 0:
-                return total_t
-    except Exception:
-        pass
-    return int((fallback_duration_sec * 295) + 4500)
-
-
 def estimate_pre_flight_cost(model_name, in_tokens, thinking_budget, expected_report_tokens=9500):
     in_rate, out_rate = get_model_rates(model_name, in_tokens)
     estimated_thinking = int(thinking_budget * 0.45) if thinking_budget > 0 else 0
@@ -656,52 +682,39 @@ def estimate_pre_flight_cost(model_name, in_tokens, thinking_budget, expected_re
     return round(est_cost, 4)
 
 
-def probe_free_key_live_quota(api_key, model_name="gemini-3.1-pro-preview"):
-    """
-    فحص حقيقي بـ 1 توكن خلال نصف ثانية قبل رفع أي ملفات صوت أو فيديو على المفتاح المجاني!
-    يمنع تضييع 3 دقائق في رفع المقاطع على مفتاح مجاني مستنفد (429).
-    """
-    url = _u(f"{GEMINI_BASE_API}/{model_name}:generateContent?key={api_key}")
+def probe_key_can_generate_on_model(api_key, model_name):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
-        "generationConfig": {"maxOutputTokens": 1, "temperature": 0.0}
+        "contents": [{"role": "user", "parts": [{"text": "ok"}]}],
+        "generationConfig": {"maxOutputTokens": 1}
     }
     try:
-        r = session.post(url, json=payload, timeout=10)
+        r = session.post(url, json=payload, timeout=12)
         if r.status_code == 200:
-            return True, "READY"
+            return True, "OK"
         elif r.status_code == 429:
             err_msg = r.json().get("error", {}).get("message", "")
-            m = re.search(r'Please retry in ([a-zA-Z0-9.]+)', err_msg)
-            wait_t = m.group(1).split('.')[0] if m else "مؤقت"
-            return False, f"المفتاح مستنفد (يعمل بعد: {wait_t})"
-        elif r.status_code == 503:
-            return False, "ضغط سيرفرات (503)"
-        return True, f"HTTP {r.status_code}"
+            match = re.search(r'Please retry in ([a-zA-Z0-9.]+)', err_msg)
+            wait_t = match.group(1).split('.')[0] if match else "حصة يومية مستنفدة"
+            return False, f"429 مستنفد ({wait_t})"
+        else:
+            return False, f"HTTP {r.status_code}"
     except Exception as e:
-        return False, str(e)[:60]
+        return False, str(e)[:40]
 
 
-def get_prioritized_keys(check_live_quota=False):
+def get_prioritized_keys():
     def is_key_alive(k_str):
         try:
-            r = session.get(_u(f"{GEMINI_BASE_API}?key={k_str}"), timeout=12)
+            r = session.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={k_str}", timeout=12)
             return r.status_code == 200
         except Exception:
             return False
 
-    target_probe_model = "gemini-3.8-flash" if (IS_LOW_MODE or IS_PAID_MIN_COST) else "gemini-3.1-pro-preview"
-
     valid_free = []
     for idx, fk in enumerate(FREE_API_KEYS, start=1):
-        lbl = f"FREE (Key #{idx})"
         if is_key_alive(fk):
-            if check_live_quota:
-                ok, reason = probe_free_key_live_quota(fk, target_probe_model)
-                if not ok:
-                    log_step(f"⏭️ تخطي فوري للمفتاح {lbl} قبل رفع المقاطع: {reason}")
-                    continue
-            valid_free.append((idx, lbl, fk, False))
+            valid_free.append((idx, f"FREE (Key #{idx})", fk, False))
 
     valid_paid = None
     if PAID_API_KEY and is_key_alive(PAID_API_KEY):
@@ -712,9 +725,9 @@ def get_prioritized_keys(check_live_quota=False):
         if not valid_free:
             raise RuntimeError(
                 "رفض مسبق سريع (Pre-Flight Check): المجلد مضبوط على الوضع المجاني الإجباري (_free) "
-                "ولكن جميع المفاتيح المجانية مستنفدة حالياً. غير اسم المجلد إلى _paid لتشغيله."
+                "ولكن لا يوجد أي مفتاح مجاني صالح في الإعدادات. غير اسم المجلد إلى _paid لتشغيله."
             )
-        log_step(f"🆓 وضع المجاني الإجباري (_free): تم التحقق من {len(valid_free)} مفاتيح مجانية جاهزة.")
+        log_step(f"🆓 وضع المجاني الإجباري (_free): تم التحقق من {len(valid_free)} مفاتيح مجانية صالحة (منع استخدام المفتاح المدفوع).")
         return valid_free
 
     ordered = list(valid_free)
@@ -729,14 +742,21 @@ def get_prioritized_keys(check_live_quota=False):
 
 
 def update_drive_folder(new_name, description_text=""):
+    global ORIGINAL_SOURCE_URL
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": "application/json"}
     payload = {"name": new_name}
     if description_text:
+        if not ORIGINAL_SOURCE_URL:
+            try:
+                cur_meta = get_drive_folder_metadata()
+                ORIGINAL_SOURCE_URL = extract_url_from_text(cur_meta.get("description", "") or "")
+            except Exception:
+                pass
         if ORIGINAL_SOURCE_URL and ORIGINAL_SOURCE_URL not in description_text:
             description_text = f"🔗 رابط المصدر: {ORIGINAL_SOURCE_URL}\n\n" + description_text
         payload["description"] = description_text
     try:
-        r = session.patch(_u(f"{DRIVE_FILES_API}/{FOLDER_ID}"), headers=headers, json=payload, timeout=25)
+        r = session.patch(f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}", headers=headers, json=payload, timeout=25)
         return r.status_code in (200, 204)
     except Exception as e:
         print(f"⚠️ تحذير تحديث المجلد على Drive: {e}", flush=True)
@@ -746,19 +766,24 @@ def update_drive_folder(new_name, description_text=""):
 def upload_report_to_drive(filename, content_str, mime_type="text/html"):
     headers_list = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
     q = f"'{FOLDER_ID}' in parents and name = '{filename}' and trashed = false"
-    existing_id = None
+    existing_ids = []
     try:
-        r_list = session.get(DRIVE_FILES_API, headers=headers_list, params={"q": q, "fields": "files(id)"}, timeout=20)
+        r_list = session.get("https://www.googleapis.com/drive/v3/files", headers=headers_list, params={"q": q, "fields": "files(id)"}, timeout=20)
         if r_list.status_code == 200:
-            files = r_list.json().get("files", [])
-            if files:
-                existing_id = files[0]["id"]
+            existing_ids = [f["id"] for f in r_list.json().get("files", [])]
     except Exception:
         pass
 
     try:
-        if existing_id:
-            up_url = _u(f"{DRIVE_UPLOAD_API}/{existing_id}?uploadType=media")
+        if len(existing_ids) > 1:
+            for old_id in existing_ids[1:]:
+                try:
+                    session.delete(f"https://www.googleapis.com/drive/v3/files/{old_id}", headers=headers_list, timeout=15)
+                except Exception:
+                    pass
+
+        if existing_ids:
+            up_url = f"https://www.googleapis.com/upload/drive/v3/files/{existing_ids[0]}?uploadType=media"
             r = session.patch(
                 up_url,
                 headers={"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"{mime_type}; charset=UTF-8"},
@@ -778,7 +803,7 @@ def upload_report_to_drive(filename, content_str, mime_type="text/html"):
                 f"--{boundary}--"
             ).encode("utf-8")
             headers = {"Authorization": f"Bearer {DRIVE_TOKEN}", "Content-Type": f"multipart/related; boundary={boundary}"}
-            r = session.post(_u(f"{DRIVE_UPLOAD_API}?uploadType=multipart"), headers=headers, data=body, timeout=45)
+            r = session.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", headers=headers, data=body, timeout=45)
         return r.status_code in (200, 201)
     except Exception as e:
         print(f"⚠️ تحذير رفع التقرير {filename} إلى Drive: {e}", flush=True)
@@ -788,9 +813,9 @@ def upload_report_to_drive(filename, content_str, mime_type="text/html"):
 def get_drive_folder_metadata():
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
     r = session.get(
-        _u(f"{DRIVE_FILES_API}/{FOLDER_ID}"),
+        f"https://www.googleapis.com/drive/v3/files/{FOLDER_ID}",
         headers=headers,
-        params={"fields": "id,name,description"},
+        params={"fields": "id,name,description", "supportsAllDrives": "true"},
         timeout=25
     )
     if r.status_code == 200:
@@ -802,7 +827,7 @@ def list_drive_folder_contents():
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
     q = f"'{FOLDER_ID}' in parents and trashed = false"
     res = session.get(
-        DRIVE_FILES_API,
+        "https://www.googleapis.com/drive/v3/files",
         headers=headers,
         params={"q": q, "fields": "files(id, name, mimeType, size)"},
         timeout=30
@@ -814,8 +839,8 @@ def list_drive_folder_contents():
 def extract_url_from_text(text):
     if not text:
         return None
-    for m in re.finditer(r'(https?://[^\s<>"\'\r\n\]]+)', text):
-        candidate = _u(m.group(1).strip().rstrip('.,;)]}'))
+    for m in re.finditer(r'(https?://[^\s<>"\'\r\n]+)', text):
+        candidate = m.group(1).strip().rstrip('.,;)]}')
         if "drive.google.com/drive/folders/" not in candidate:
             return candidate
     return None
@@ -849,7 +874,7 @@ def find_video_url_in_folder(all_files, folder_desc=""):
         try:
             if mime == "application/vnd.google-apps.document":
                 r = session.get(
-                    _u(f"{DRIVE_FILES_API}/{f['id']}/export"),
+                    f"https://www.googleapis.com/drive/v3/files/{f['id']}/export",
                     headers=headers,
                     params={"mimeType": "text/plain"},
                     timeout=20
@@ -861,7 +886,7 @@ def find_video_url_in_folder(all_files, folder_desc=""):
                         return url, f"مستند Google Doc ({fname})"
             elif mime.startswith("text/") or fname.lower().endswith((".txt", ".url", ".webloc", ".md")):
                 r = session.get(
-                    _u(f"{DRIVE_FILES_API}/{f['id']}?alt=media"),
+                    f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media",
                     headers=headers,
                     timeout=20
                 )
@@ -878,7 +903,7 @@ def find_video_url_in_folder(all_files, folder_desc=""):
 
 def upload_binary_file_to_drive_folder(local_path, drive_filename, mime_type="video/mp4"):
     filesize = os.path.getsize(local_path)
-    init_url = _u(f"{DRIVE_UPLOAD_API}?uploadType=resumable")
+    init_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
     headers = {
         "Authorization": f"Bearer {DRIVE_TOKEN}",
         "Content-Type": "application/json; charset=UTF-8",
@@ -888,7 +913,7 @@ def upload_binary_file_to_drive_folder(local_path, drive_filename, mime_type="vi
     metadata = {"name": drive_filename, "parents": [FOLDER_ID]}
     r = session.post(init_url, headers=headers, json=metadata, timeout=30)
     r.raise_for_status()
-    upload_url = _u(r.headers["Location"])
+    upload_url = r.headers["Location"]
 
     chunk_size = 16 * 1024 * 1024
     offset = 0
@@ -909,7 +934,7 @@ def upload_binary_file_to_drive_folder(local_path, drive_filename, mime_type="vi
 
 def download_drive_file(file_id, local_path):
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
-    with session.get(_u(f"{DRIVE_FILES_API}/{file_id}?alt=media"), headers=headers, stream=True, timeout=120) as r:
+    with session.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(local_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
@@ -918,7 +943,6 @@ def download_drive_file(file_id, local_path):
 
 
 def download_video_from_external_url(url, local_path):
-    url = _u(url)
     gdrive_match = re.search(r'(?:/file/d/|id=)([a-zA-Z0-9_-]{20,})', url)
     if gdrive_match and "drive.google.com" in url:
         file_id = gdrive_match.group(1)
@@ -953,7 +977,7 @@ def download_video_from_external_url(url, local_path):
             capture_output=True, text=True, timeout=25
         )
         if probe_chk.returncode == 0 and float(probe_chk.stdout.strip() or 0) > 0:
-            log_step("⚡ الرابط يدعم البث/التقطيع المباشر عبر FFmpeg!")
+            log_step("⚡ الرابط يدعم البث/التقطيع المباشر عبر FFmpeg (مثل منظومة البرودكاست تماماً)!")
             return url
     except Exception:
         pass
@@ -1063,7 +1087,7 @@ def upload_to_gemini_file_api(filepath, api_key):
     mime = "audio/mp3" if filepath.endswith(".mp3") else "video/mp4"
     filesize = os.path.getsize(filepath)
 
-    init_url = _u(f"{GEMINI_UPLOAD_API}?key={api_key}")
+    init_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}"
     init_headers = {
         "X-Goog-Upload-Protocol": "resumable",
         "X-Goog-Upload-Command": "start",
@@ -1073,7 +1097,7 @@ def upload_to_gemini_file_api(filepath, api_key):
     }
     r = session.post(init_url, headers=init_headers, json={"file": {"display_name": filepath}}, timeout=30)
     r.raise_for_status()
-    upload_url = _u(r.headers["X-Goog-Upload-URL"])
+    upload_url = r.headers["X-Goog-Upload-URL"]
 
     chunk_size = 8 * 1024 * 1024
     offset = 0
@@ -1099,15 +1123,18 @@ def upload_to_gemini_file_api(filepath, api_key):
 
     for _ in range(60):
         if file_info.get("state") == "ACTIVE":
-            return _u(file_info["uri"]), mime
+            return file_info["uri"], mime
         time.sleep(3)
-        chk = session.get(_u(f"{file_info['uri']}?key={api_key}"), timeout=20).json()
+        chk = session.get(f"{file_info['uri']}?key={api_key}", timeout=20).json()
         file_info["state"] = chk.get("state")
     raise RuntimeError(f"لم يصبح الملف {filepath} في حالة ACTIVE بعد الرفع.")
 
 
+# ==============================================================================
+# المسار الأول: النسخة الاحترافية المتدرجة (تختار النموذج وتفحص الكوتا قبل رفع أي ملف!)
+# ==============================================================================
 def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
-    pro_First_models = [
+    all_candidate_models = [
         ("gemini-3.1-pro-preview", 24576, "gemini-3.1-pro-preview (Max Thinking 24576)", True),
         ("gemini-3.1-pro-preview", 8192,  "gemini-3.1-pro-preview (Med Thinking 8192)",  False),
         ("gemini-3.8-flash",       24576, "gemini-3.8-flash (High Thinking 24576)",      False),
@@ -1122,7 +1149,7 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
         ("gemini-3.7-flash",       0,     "gemini-3.7-flash (Standard Fast)",            False),
         ("gemini-3.6-flash",       0,     "gemini-3.6-flash (Standard Fast)",            False),
     ]
-    models = lean_first_models if IS_PAID_MIN_COST else pro_First_models
+    base_models = lean_first_models if IS_PAID_MIN_COST else all_candidate_models
 
     audio_segs = sorted(glob.glob("Audio_part*.mp3"))
     seg_timeline_info = []
@@ -1134,6 +1161,28 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
         seg_timeline_info.append(f"- الجزء {idx:02d} ({aseg}): [{start_str}] -> [{end_str}]")
         accum_sec += dur
     timeline_map_str = "\n".join(seg_timeline_info)
+
+    est_in_tokens = int((accum_sec * 295) + 4800)
+    remaining_monthly = max(0.0, round(MAX_MONTHLY_BUDGET - get_monthly_spend(), 4))
+    effective_cap = min(EPISODE_MAX_COST, remaining_monthly)
+
+    eligible_models = []
+    for m_name, m_budget, m_label, m_high in base_models:
+        if FORCE_FREE:
+            if "pro" not in m_name.lower():
+                eligible_models.append((m_name, m_budget, m_label, m_high))
+        else:
+            est_c = estimate_pre_flight_cost(m_name, est_in_tokens, m_budget)
+            if est_c <= effective_cap:
+                eligible_models.append((m_name, m_budget, m_label, m_high))
+            else:
+                log_step(f"💸 استبعاد مسبق لـ {m_label} قبل الرفع: تكلفته المقدرة (${est_c:.3f}) أعلى من سقف الحلقة (${effective_cap:.2f})")
+
+    if not eligible_models:
+        log_step("🔄 جميع نماذج الدفعة الواحدة تتجاوز السقف المحدد — التحول التلقائي الذكي إلى مسار التجزئة الاقتصادية (_LOW)!")
+        return evaluate_low_free_mode(segments, exact_duration, total_segments_count)
+
+    log_step(f"🎯 النموذج المرشح الأول المطابق لسقف الميزانية: {eligible_models[0][2]}")
 
     system_prompt = (
         f"{SKILL_INSTRUCTIONS_AND_RUBRIC}\n\n"
@@ -1151,31 +1200,39 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
         "   - summarizedHtml: (string) كود HTML الكامل للتقرير المختصر شاملاً جدول البيانات والنتيجة الإجمالية وجدول المعايير الستة الأساسية."
     )
 
-    prioritized_keys = get_prioritized_keys(check_live_quota=True)
+    prioritized_keys = get_prioritized_keys()
     errors = []
 
     for key_idx, key_label, api_key, is_paid_key in prioritized_keys:
-        log_step(f"🔑 فحص المفتاح {key_label}...")
-
-        # فحص إضافي مباشر للمفتاح المجاني قبل رفع المقاطع لمنع أي تضييع للوقت
-        if not is_paid_key:
-            ok_probe, probe_reason = probe_free_key_live_quota(api_key, models[0][0])
-            if not ok_probe:
-                log_step(f"⚡ تخطي {key_label} قبل رفع المقاطع ({probe_reason})...")
-                errors.append(f"• {key_label}: {probe_reason}")
-                continue
-
         if is_paid_key:
             current_monthly_spend = get_monthly_spend()
             if current_monthly_spend >= MAX_MONTHLY_BUDGET:
-                ceil_msg = (
-                    f"تم إيقاف العملية: وصل الإنفاق الشهري إلى الحد الأقصى المسموح به "
-                    f"(${current_monthly_spend:.4f} / ${MAX_MONTHLY_BUDGET:.2f})."
-                )
+                ceil_msg = f"تم إيقاف العملية: وصل الإنفاق الشهري إلى الحد الأقصى (${current_monthly_spend:.4f} / ${MAX_MONTHLY_BUDGET:.2f})."
                 log_step(f"🛑 {ceil_msg}")
                 errors.append(f"• {key_label}: {ceil_msg}")
                 raise RuntimeError("\n".join(errors))
-            log_step(f"💰 فحص سقف الميزانية للمفتاح المدفوع: المستهلك هذا الشهر ${current_monthly_spend:.4f} من أصل ${MAX_MONTHLY_BUDGET:.2f}")
+
+        key_models = eligible_models if is_paid_key else [m for m in eligible_models if "pro" not in m[0].lower()]
+        if not key_models:
+            key_models = eligible_models
+
+        probe_ok = False
+        active_key_models = []
+        for m_tuple in key_models:
+            ok, reason = probe_key_can_generate_on_model(api_key, m_tuple[0])
+            if ok:
+                probe_ok = True
+                active_key_models.append(m_tuple)
+            else:
+                if not is_paid_key:
+                    log_step(f"⚡ تخطي {key_label} فوراً بدون رفع ملفات (نتيجة الفحص اللحظي على {m_tuple[0]}: {reason})")
+                    errors.append(f"• {key_label} [{m_tuple[0]}]: {reason}")
+                    break
+
+        if not probe_ok:
+            continue
+
+        log_step(f"✅ المفتاح {key_label} اجتاز الفحص اللحظي بنجاح! جاري رفع المقاطع الآن...")
 
         try:
             prompt_parts = []
@@ -1191,37 +1248,12 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
 
         user_instruction = (
             f"قم بتحليل وتقييم حلقة ({CLEAN_NAME}) بالكامل من 00:00:00 إلى {exact_duration} "
-            "وفق السلم المعتمد (90 نقطة - 6 معايير أساسية و23 معياراً فرعياً) والقوالب المعتمدة في التعليمات، "
-            "مع الالتزام التام بمراعاة الخط التحريري للقناة وقاعدة اللهجة اللبنانية المحكية، وإيراد الاقتباسات الحرفية والشواهد البصرية للغة الجسد بالتوقيتات الدقيقة."
+            f"وفق [{EDITORIAL_TYPE_LABEL}] والسلم المعتمد (90 نقطة - 6 معايير أساسية و23 معياراً فرعياً) والقوالب الملونة المعتمدة في التعليمات، "
+            "مع الالتزام التام بقاعدة اللهجة اللبنانية المحكية، وإيراد الاقتباسات الحرفية والشواهد البصرية للغة الجسد بالتوقيتات الدقيقة."
         )
         full_contents = [{"role": "user", "parts": prompt_parts + [{"text": user_instruction}]}]
 
-        in_tokens_count = None
-        if is_paid_key:
-            in_tokens_count = count_input_tokens_pre_flight(
-                models[0][0], system_prompt, full_contents, api_key, fallback_duration_sec=accum_sec
-            )
-            remaining_monthly = round(MAX_MONTHLY_BUDGET - get_monthly_spend(), 4)
-            log_step(
-                f"🧮 الفحص المسبق لتكلفة الحلقة كاملة ({len(segments)} أجزاء مجتمعة = {in_tokens_count:,} توكن) | "
-                f"سقف الحلقة الكلي المسموح: ${EPISODE_MAX_COST:.2f} ({EPISODE_COST_SOURCE}) | "
-                f"المتبقي من سقف الشهر: ${remaining_monthly:.2f}"
-            )
-
-        skipped_due_to_cost = []
-        for model_name, budget, label, is_highest in models:
-            if is_paid_key and in_tokens_count is not None:
-                est_cost = estimate_pre_flight_cost(model_name, in_tokens_count, budget)
-                remaining_monthly = round(MAX_MONTHLY_BUDGET - get_monthly_spend(), 4)
-                effective_cap = min(EPISODE_MAX_COST, remaining_monthly)
-                if est_cost > effective_cap:
-                    skip_msg = f"تخطي {label}: التكلفة المقدرة (${est_cost:.3f}) أعلى من السقف المحدد للحلقة (${effective_cap:.2f})"
-                    log_step(f"💸 {skip_msg} - الانتقال لنموذج أوفر يناسب السقف...")
-                    skipped_due_to_cost.append(f"• {label}: مقدر بـ ${est_cost:.3f} (السقف ${effective_cap:.2f})")
-                    continue
-                else:
-                    log_step(f"✅ النموذج {label} يطابق سقف التكلفة المحدد (التكلفة المقدرة: ~${est_cost:.3f} <= ${effective_cap:.2f})...")
-
+        for model_name, budget, label, is_highest in active_key_models:
             log_step(f"🧠 بدء التحليل العميق لجميع الأجزاء عبر النموذج: {label} ({key_label})...")
             gen_cfg = {
                 "temperature": 0.0,
@@ -1236,10 +1268,10 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
                 "contents": full_contents,
                 "generationConfig": gen_cfg
             }
-            url = _u(f"{GEMINI_BASE_API}/{model_name}:generateContent?key={api_key}")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
 
             try:
-                res = session.post(url, json=payload, timeout=600 if is_paid_key else 200)
+                res = session.post(url, json=payload, timeout=600 if is_paid_key else 210)
                 if res.status_code == 200:
                     data = res.json()
                     text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -1253,8 +1285,9 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
                         log_step(f"💵 تكلفة هذه العملية: ${process_cost:.4f} | إجمالي إنفاق الشهر: ${total_monthly:.4f} / ${MAX_MONTHLY_BUDGET:.2f}")
                     else:
                         total_monthly = get_monthly_spend()
+                        log_step(f"🆓 اكتملت العملية مجاناً ($0.0000) عبر {key_label}!")
 
-                    banner = "" if is_highest else f'<div class="thinking-note">مستوى التفكير: {label} ({key_label})</div>'
+                    banner = f'<div class="thinking-note">المنظومة: {EDITORIAL_TYPE_LABEL} | النموذج: {label} ({key_label}) | تكلفة العملية: ${process_cost:.4f}</div>'
                     parsed["thinkingBanner"] = banner
                     parsed["costInfo"] = {
                         "keyLabel": key_label,
@@ -1268,18 +1301,18 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
                     err_msg = res.json().get("error", {}).get("message", "")
                     match = re.search(r'Please retry in ([a-zA-Z0-9.]+)', err_msg)
                     wait_time = match.group(1).split('.')[0] if match else "مؤقت"
-                    clean_err = f"المفتاح مستنفد (يعمل بعد: {wait_time})"
+                    clean_err = f"المفتاح مستنفد لـ {len(segments)} أجزاء مجتمعة ({wait_time})"
                     log_step(f"⚡ {clean_err} على {key_label} - انتقال فوري بدون انتظار...")
                     errors.append(f"• {key_label} [{label}]: {clean_err}")
                     if not is_paid_key:
                         break
                     continue
                 elif res.status_code == 503:
-                    log_step(f"⚡ ضغط سيرفرات جوجل (503) على {label} ({key_label}) - انتقال فوري للنموذج/المفتاح التالي...")
+                    log_step(f"⚡ ضغط سيرفرات جوجل (503) على {label} ({key_label}) - انتقال فوري...")
                     errors.append(f"• {key_label} [{label}]: ضغط سيرفرات جوجل (503)")
                     continue
                 else:
-                    log_step(f"⚠️ استجابة HTTP {res.status_code} على {label} ({key_label}) - انتقال للنموذج/المفتاح التالي...")
+                    log_step(f"⚠️ استجابة HTTP {res.status_code} على {label} ({key_label}) - انتقال للتالي...")
                     errors.append(f"• {key_label} [{label}]: HTTP {res.status_code}")
                     continue
             except Exception as req_err:
@@ -1289,42 +1322,34 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
                     break
                 continue
 
-        if is_paid_key and skipped_due_to_cost:
-            log_step("🔄 جميع نماذج الدفعة الواحدة تتجاوز السقف المحدد — التحول التلقائي الذكي إلى مسار التجزئة الاقتصادية (_LOW) لإنجاز الحلقة ضمن السقف!")
-            return evaluate_low_free_mode(segments, exact_duration, total_segments_count)
-
     raise RuntimeError("\n".join(errors))
 
 
+# ==============================================================================
+# المسار الثاني: نسخة (_LOW) - تحليل كل مقطع على حدة مع الفحص اللحظي قبل الرفع
+# ==============================================================================
 def call_gemini_low_mode_step(system_prompt, user_parts_builder, models_list, step_title, expect_json=True, current_ep_spent=0.0):
-    prioritized_keys = get_prioritized_keys(check_live_quota=True)
+    prioritized_keys = get_prioritized_keys()
     errors = []
 
     for key_idx, key_label, api_key, is_paid_key in prioritized_keys:
-        if not is_paid_key:
-            ok_probe, probe_reason = probe_free_key_live_quota(api_key, models_list[0][0])
-            if not ok_probe:
-                log_step(f"⚡ [{step_title}] تخطي {key_label} قبل الرفع ({probe_reason})...")
-                continue
-
         if is_paid_key:
             current_monthly_spend = get_monthly_spend()
             if current_monthly_spend >= MAX_MONTHLY_BUDGET:
-                ceil_msg = (
-                    f"تم إيقاف العملية: وصل الإنفاق الشهري إلى الحد الأقصى المسموح به "
-                    f"(${current_monthly_spend:.4f} / ${MAX_MONTHLY_BUDGET:.2f})."
-                )
+                ceil_msg = f"وصل الإنفاق الشهري للحد الأقصى (${current_monthly_spend:.4f} / ${MAX_MONTHLY_BUDGET:.2f})."
                 log_step(f"🛑 {ceil_msg}")
-                errors.append(f"• {key_label}: {ceil_msg}")
-                raise RuntimeError("\n".join(errors))
+                raise RuntimeError(ceil_msg)
             if current_ep_spent >= EPISODE_MAX_COST:
-                ep_ceil_msg = (
-                    f"تم إيقاف العملية: وصلت التكلفة التراكمية لأجزاء الحلقة (${current_ep_spent:.4f}) "
-                    f"إلى السقف الكلي المحدد للحلقة (${EPISODE_MAX_COST:.2f})."
-                )
+                ep_ceil_msg = f"وصلت التكلفة التراكمية (${current_ep_spent:.4f}) إلى سقف الحلقة (${EPISODE_MAX_COST:.2f})."
                 log_step(f"🛑 {ep_ceil_msg}")
-                errors.append(f"• {key_label}: {ep_ceil_msg}")
-                raise RuntimeError("\n".join(errors))
+                raise RuntimeError(ep_ceil_msg)
+
+        if not is_paid_key:
+            ok, reason = probe_key_can_generate_on_model(api_key, models_list[0][0])
+            if not ok:
+                log_step(f"⚡ تخطي {key_label} فوراً بدون رفع ملفات ({reason})")
+                errors.append(f"• {key_label}: {reason}")
+                continue
 
         try:
             prompt_parts = user_parts_builder(api_key, key_label)
@@ -1347,7 +1372,7 @@ def call_gemini_low_mode_step(system_prompt, user_parts_builder, models_list, st
                     "contents": [{"role": "user", "parts": prompt_parts}],
                     "generationConfig": gen_cfg
                 }
-                url = _u(f"{GEMINI_BASE_API}/{model_name}:generateContent?key={api_key}")
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
 
                 try:
                     res = session.post(url, json=payload, timeout=400 if is_paid_key else 180)
@@ -1364,12 +1389,11 @@ def call_gemini_low_mode_step(system_prompt, user_parts_builder, models_list, st
                     elif res.status_code in (429, 503):
                         clean_err = f"HTTP {res.status_code}"
                         if not is_paid_key:
-                            log_step(f"⚡ [{step_title}] المفتاح المجاني ({key_label}) مشغول ({res.status_code}) — انتقال فوري للمفتاح التالي!")
+                            log_step(f"⚡ [{step_title}] المفتاح المجاني ({key_label}) مشغول ({res.status_code}) — انتقال فوري!")
                             errors.append(f"• {key_label} [{label}]: {clean_err}")
                             break
                         if attempt < max_attempts:
                             wait_sec = 25 * attempt
-                            log_step(f"⏳ [{step_title}] ضغط مؤقت ({res.status_code}) على المدفوع. انتظار {wait_sec} ثانية...")
                             time.sleep(wait_sec)
                             continue
                         errors.append(f"• {key_label} [{label}]: {clean_err}")
@@ -1378,7 +1402,6 @@ def call_gemini_low_mode_step(system_prompt, user_parts_builder, models_list, st
                         errors.append(f"• {key_label} [{label}]: HTTP {res.status_code}")
                         break
                 except Exception as req_err:
-                    log_step(f"⚠️ [{step_title}] خطأ اتصال مؤقت: {str(req_err)[:50]}...")
                     errors.append(f"• {key_label} [{label}]: {str(req_err)[:50]}")
                     if not is_paid_key:
                         break
@@ -1418,14 +1441,6 @@ def evaluate_low_free_mode(segments, exact_duration, total_segments_count):
         })
         accum_sec += dur
 
-    est_total_low_tokens = int((accum_sec * 180) + (num_parts * 4500))
-    est_total_low_cost = round((est_total_low_tokens * (0.15 / 1_000_000)) + ((num_parts + 1) * 4000 * (0.60 / 1_000_000)), 4)
-    if FORCE_PAID and est_total_low_cost > EPISODE_MAX_COST:
-        raise RuntimeError(
-            f"⛔ تم إيقاف العملية قبل السحب المالي: التكلفة الإجمالية المقدرة لجميع أجزاء الحلقة ({num_parts * 2} أجزاء) "
-            f"في الوضع الاقتصادي هي ~${est_total_low_cost:.3f} وهي أعلى من السقف المحدد للحلقة (${EPISODE_MAX_COST:.2f})."
-        )
-
     part_summaries = []
     used_label = ""
     used_key_label = ""
@@ -1442,7 +1457,7 @@ def evaluate_low_free_mode(segments, exact_duration, total_segments_count):
             f"أنت الآن تحلل المقطع رقم ({idx + 1} من {num_parts}) والذي يمتد في الحلقة الأصلية من التوقيت [{p['start_str']}] إلى [{p['end_str']}].\n"
             "قواعد صارمة لهذا المقطع:\n"
             f"1. قاعدة التوقيت المتصل: أضف دائماً وقت بداية هذا المقطع ({p['start_str']}) إلى أي توقيت ترصده داخل الملف، لتكون جميع التوقيتات المدونة بين [{p['start_str']}] و [{p['end_str']}].\n"
-            "2. استخرج تقريراً تحليلياً تفصيلياً وشاملاً لهذا المقطع يغطي المعايير الـ 6 الأساسية والـ 23 معياراً فرعياً، مع تدوين الاقتباسات الحرفية والرصد البصري الدقيق للغة الجسد بتوقيتاتها المتصلة.\n"
+            "2. استخرج تقريراً تحليلياً تفصيلياً وشاملاً لهذا المقطع يغطي المعايير الـ 6 الأساسية والـ 23 معياراً فرعياً، مع تدوين الاقتباسات الحرفية والرصد البصري الدقيق للغة الجسد بتوقيتاتها المتصلة، ومراعاة قاعدة اللهجة اللبنانية المحكية.\n"
             + ("3. هام جداً (المقطع الأخير): استمع بدقة إلى الدقيقة الأخيرة من هذا المقطع واكتب في نهاية تحليلك تحت عنوان [LAST_SPOKEN_WORDS] النص الحرفي (Verbatim) لآخر جملتين أو ثلاث جمل قالها المقدم أو الضيف قبل ختام الحلقة مع توقيتها المتصل." if is_last_part else "")
         )
 
@@ -1474,10 +1489,6 @@ def evaluate_low_free_mode(segments, exact_duration, total_segments_count):
             total_process_cost += step_cost
         part_summaries.append(f"=== تحليل المقطع {idx + 1} (من {p['start_str']} إلى {p['end_str']}) ===\n{part_text}")
 
-        if not is_last_part and not is_paid:
-            log_step("⏳ تهدئة 15 ثانية قبل المقطع التالي...")
-            time.sleep(15)
-
     log_step("📊 دمج تحليلات جميع المقاطع وإصدار التقرير النهائي الموحد (90 نقطة)...")
     combined_notes = "\n\n".join(part_summaries)
 
@@ -1485,15 +1496,15 @@ def evaluate_low_free_mode(segments, exact_duration, total_segments_count):
         f"{SKILL_INSTRUCTIONS_AND_RUBRIC}\n\n"
         f"أمامك التحليلات التفصيلية الكاملة لجميع مقاطع الحلقة ({CLEAN_NAME}) والبالغة مدتها الإجمالية ({exact_duration}).\n"
         "قواعد إجبارية صارمة:\n"
-        f"1. قم بدمج وتوحيد هذه التحليلات في تقييم نهائي واحد متكامل وشامل للحلقة كاملة من (00:00:00) حتى ({exact_duration}) وفق المعايير الستة الأساسية والـ 23 معياراً فرعياً والقوالب المعتمدة.\n"
+        f"1. قم بدمج وتوحيد هذه التحليلات في تقييم نهائي واحد متكامل وشامل للحلقة كاملة من (00:00:00) حتى ({exact_duration}) وفق المعايير الستة الأساسية والـ 23 معياراً فرعياً والقوالب الملونة المعتمدة.\n"
         "2. يمنع نهائياً كتابة عبارات مثل (في الجزء الأول أو المقطع الثاني)، بل تعامل مع الحلقة كوحدة متصلة بالتوقيتات المطلقة.\n"
         "3. استخرج النص الحرفي لآخر كلام قيل في ختام الحلقة مع توقيته المتصل وضعه في حقل lastSpokenWords.\n"
         "4. أرجع كائن JSON حصراً بالحقول التالية:\n"
         "   - isFullDurationAnalyzed: (boolean) ضعه true\n"
         "   - analyzedAllSegments: (boolean) ضعه true\n"
         "   - lastSpokenWords: (string) النص الحرفي لآخر كلام قيل في ختام الحلقة مع التوقيت المتصل.\n"
-        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل والمنسق بـ HTML وفق القالب المعتمد.\n"
-        "   - summarizedHtml: (string) التقرير المختصر والمنسق بـ HTML وفق القالب المعتمد."
+        "   - mainDetailedHtml: (string) التقرير الرئيسي المفصل والمنسق بـ HTML وفق القالب الملون المعتمد.\n"
+        "   - summarizedHtml: (string) التقرير المختصر والمنسق بـ HTML وفق القالب الملون المعتمد."
     )
 
     def build_final_text_parts(api_key, key_label):
@@ -1517,7 +1528,7 @@ def evaluate_low_free_mode(segments, exact_duration, total_segments_count):
         '⚠️ <b>تنبيه نوع المنظومة:</b> تم اختيار <b>المنظومة الاقتصادية (_LOW) (صورة كل 5 ثوان)</b>. '
         'للحصول على الدقة التحليلية القصوى (صورة كل ثانية)، يرجى تسمية المجلد بدون لاحقة <code>_LOW</code>.'
         '</div>'
-        f'<div class="thinking-note">المنظومة: {MODE_TITLE} | النموذج: {used_label} ({used_key_label})</div>'
+        f'<div class="thinking-note">المنظومة: {MODE_TITLE} | النموذج: {used_label} ({used_key_label}) | التكلفة: ${total_process_cost:.4f}</div>'
     )
     parsed["costInfo"] = {
         "keyLabel": used_key_label,
@@ -1547,69 +1558,9 @@ def clean_inner_html(raw_html):
     return raw_html.strip()
 
 
-def beautify_and_wrap_html(title, body_content, run_cost_usd=0.0):
-    """
-    تنسيق التقرير بألوان تنفيذية واضحة ومتوافقة 100% مع Microsoft Word (Royal Executive RTL Theme)
-    مع تضمين تعليق التكلفة المخفي ليقرأه Code.gs كضمان إضافي.
-    """
-    cleaned = clean_inner_html(body_content)
-
-    # 1. وضع العنوان الرئيسي والفرعي داخل ترويسة كحلية ملكية (.header-banner)
-    if 'class="header-banner"' not in cleaned:
-        cleaned = re.sub(
-            r"(<h1>.*?</h1>\s*(?:<div class=[\"']subtitle[\"']>.*?</div>)?)",
-            r'<div class="header-banner">\1</div>',
-            cleaned,
-            count=1,
-            flags=re.DOTALL
-        )
-
-    # 2. وضع الخلاصة التنفيذية والخلاصة النهائية داخل صندوق أزرق مميز (.exec-box)
-    cleaned = re.sub(
-        r"(<h2>\s*الخلاصة التنفيذية\s*</h2>\s*)(?!<div class=[\"']exec-box[\"']>)(<p>.*?</p>)",
-        r'\1<div class="exec-box">\2</div>',
-        cleaned,
-        flags=re.DOTALL
-    )
-    cleaned = re.sub(
-        r"(<h2>\s*الخلاصة النهائية\s*</h2>\s*)(?!<div class=[\"']exec-box[\"']>)(<p>.*?</p>)",
-        r'\1<div class="exec-box">\2</div>',
-        cleaned,
-        flags=re.DOTALL
-    )
-
-    # 3. وضع نقاط القوة الرئيسية داخل صندوق أخضر زمردي (.strengths-box)
-    cleaned = re.sub(
-        r"(<h2>\s*نقاط القوة[^<]*</h2>\s*)(?!<div class=[\"']strengths-box[\"']>)(<ul>.*?</ul>)",
-        r'\1<div class="strengths-box">\2</div>',
-        cleaned,
-        flags=re.DOTALL
-    )
-
-    # 4. وضع أولويات التطوير داخل صندوق كهرماني دافئ (.priorities-box)
-    cleaned = re.sub(
-        r"(<h2>\s*أولويات التطوير[^<]*</h2>\s*)(?!<div class=[\"']priorities-box[\"']>)(<ul>.*?</ul>)",
-        r'\1<div class="priorities-box">\2</div>',
-        cleaned,
-        flags=re.DOTALL
-    )
-
-    # 5. تمييز خلايا العلامات داخل الجداول (مثل 4.5/5 أو 16 من 20)
-    cleaned = re.sub(
-        r"<td>\s*(\d+(?:\.\d+)?\s*(?:/|من)\s*\d+(?:\.\d+)?)\s*</td>",
-        r'<td class="score-cell">\1</td>',
-        cleaned
-    )
-
-    # 6. تمييز الطوابع الزمنية بشارة زرقاء واضحة
-    cleaned = re.sub(
-        r"(من\s+\d{2}:\d{2}(?::\d{2})?\s+إلى\s+\d{2}:\d{2}(?::\d{2})?)",
-        r'<span class="ts-badge">\1</span>',
-        cleaned
-    )
-
-    return f"""<!-- COST_USD: {run_cost_usd:.4f} -->
-<!DOCTYPE html>
+def wrap_html(title, body_content):
+    cleaned_body = clean_inner_html(body_content)
+    return f"""<!DOCTYPE html>
 <html xmlns:o="urn:schemas-microsoft-com:office:office"
       xmlns:w="urn:schemas-microsoft-com:office:word"
       xmlns="http://www.w3.org/TR/REC-html40"
@@ -1629,182 +1580,187 @@ def beautify_and_wrap_html(title, body_content, run_cost_usd=0.0):
 <style>
   @page {{ size: A4; margin: 1.8cm; }}
   body {{
-    font-family: "Segoe UI", "Tahoma", "Arial", sans-serif;
-    font-size: 12pt;
-    line-height: 1.65;
-    direction: rtl;
-    text-align: right;
-    color: #0F172A;
-    max-width: 980px;
-    margin: 24px auto;
-    padding: 24px;
-    background-color: #FFFFFF;
+      font-family: "Segoe UI", "Tahoma", "Arial", sans-serif;
+      font-size: 12pt;
+      line-height: 1.65;
+      direction: rtl;
+      text-align: right;
+      color: #0F172A;
+      max-width: 980px;
+      margin: 24px auto;
+      padding: 24px;
+      background-color: #FFFFFF;
   }}
   .low-mode-banner {{
-    background-color: #FFF3CD;
-    color: #856404;
-    border: 2px solid #FFEEBA;
-    border-right: 6px solid #FFC107;
-    padding: 12px 16px;
-    margin-bottom: 16px;
-    border-radius: 6px;
-    font-size: 11.5pt;
+      background-color: #FFF3CD;
+      color: #856404;
+      border: 2px solid #FFEEBA;
+      border-right: 6px solid #FFC107;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+      border-radius: 6px;
+      font-size: 11pt;
   }}
   .thinking-note {{
-    font-size: 9.5pt;
-    color: #1E3A8A;
-    background-color: #EFF6FF;
-    border: 1px solid #BFDBFE;
-    border-right: 4px solid #2563EB;
-    padding: 6px 12px;
-    margin-bottom: 14px;
-    border-radius: 4px;
-    text-align: right;
-    font-weight: bold;
+      font-size: 9.5pt;
+      color: #1E3A8A;
+      background-color: #EFF6FF;
+      border: 1px solid #BFDBFE;
+      border-right: 4px solid #2563EB;
+      padding: 7px 12px;
+      margin-bottom: 16px;
+      border-radius: 4px;
+      text-align: right;
+      font-weight: bold;
   }}
   .header-banner {{
-    background-color: #1E3A8A;
-    color: #FFFFFF;
-    padding: 22px 24px;
-    border-radius: 8px;
-    border-bottom: 5px solid #F59E0B;
-    margin-bottom: 22px;
-    text-align: center;
+      background-color: #1E3A8A;
+      color: #FFFFFF;
+      padding: 22px 24px;
+      border-radius: 8px;
+      border-bottom: 5px solid #F59E0B;
+      margin-bottom: 22px;
+      text-align: center;
   }}
-  .header-banner h1, h1 {{
-    text-align: center;
-    font-size: 20pt;
-    font-weight: bold;
-    color: #FFFFFF;
-    margin: 0 0 6px 0;
-    page-break-after: avoid;
+  h1 {{
+      text-align: center;
+      font-size: 20pt;
+      font-weight: bold;
+      color: #1E3A8A;
+      margin: 0 0 6px 0;
+      page-break-after: avoid;
+  }}
+  .header-banner h1 {{
+      color: #FFFFFF;
   }}
   .subtitle {{
-    text-align: center;
-    font-size: 13.5pt;
-    font-weight: bold;
-    color: #E2E8F0;
-    margin: 0;
-    page-break-after: avoid;
+      text-align: center;
+      font-size: 13.5pt;
+      font-weight: bold;
+      color: #475569;
+      margin: 0 0 14px 0;
+      page-break-after: avoid;
+  }}
+  .header-banner .subtitle {{
+      color: #E2E8F0;
+      margin: 0;
   }}
   h2 {{
-    font-size: 14.5pt;
-    font-weight: bold;
-    color: #1E3A8A;
-    background-color: #F1F5F9;
-    border-right: 6px solid #1E3A8A;
-    border-bottom: 1px solid #CBD5E1;
-    padding: 8px 14px;
-    margin-top: 24px;
-    margin-bottom: 12px;
-    border-radius: 4px;
-    page-break-after: avoid;
+      font-size: 14pt;
+      font-weight: bold;
+      color: #1E3A8A;
+      background-color: #F1F5F9;
+      border-right: 6px solid #1E3A8A;
+      border-bottom: 1px solid #CBD5E1;
+      padding: 8px 14px;
+      margin-top: 24px;
+      margin-bottom: 12px;
+      border-radius: 4px;
+      page-break-after: avoid;
   }}
-  p {{ margin-top: 6px; margin-bottom: 12px; text-align: justify; }}
+  p {{
+      margin-top: 6px;
+      margin-bottom: 12px;
+      text-align: justify;
+  }}
   .exec-box {{
-    background-color: #EFF6FF;
-    border: 1px solid #BFDBFE;
-    border-right: 6px solid #1D4ED8;
-    padding: 14px 18px;
-    border-radius: 6px;
-    margin-bottom: 18px;
+      background-color: #EFF6FF;
+      border: 1px solid #BFDBFE;
+      border-right: 6px solid #1D4ED8;
+      padding: 14px 18px;
+      border-radius: 6px;
+      margin-bottom: 18px;
   }}
   .strengths-box {{
-    background-color: #F0FDF4;
-    border: 1px solid #BBF7D0;
-    border-right: 6px solid #16A34A;
-    padding: 14px 20px;
-    border-radius: 6px;
-    margin-bottom: 18px;
+      background-color: #F0FDF4;
+      border: 1px solid #BBF7D0;
+      border-right: 6px solid #16A34A;
+      padding: 14px 20px;
+      border-radius: 6px;
+      margin-bottom: 18px;
   }}
   .strengths-box li {{ color: #064E3B; font-weight: 500; }}
   .priorities-box {{
-    background-color: #FFFBEB;
-    border: 1px solid #FDE68A;
-    border-right: 6px solid #D97706;
-    padding: 14px 20px;
-    border-radius: 6px;
-    margin-bottom: 18px;
+      background-color: #FFFBEB;
+      border: 1px solid #FDE68A;
+      border-right: 6px solid #D97706;
+      padding: 14px 20px;
+      border-radius: 6px;
+      margin-bottom: 18px;
   }}
   .priorities-box li {{ color: #78350F; font-weight: 500; }}
   table {{
-    width: 100%;
-    border-collapse: collapse;
-    margin-bottom: 18px;
-    page-break-inside: avoid;
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 18px;
+      page-break-inside: avoid;
   }}
   table, th, td {{ border: 1px solid #CBD5E1; }}
   th, td {{
-    padding: 9px 12px;
-    text-align: right;
-    vertical-align: top;
-    page-break-inside: avoid;
+      padding: 9px 12px;
+      text-align: right;
+      vertical-align: top;
+      page-break-inside: avoid;
   }}
   tr {{ page-break-inside: avoid; page-break-after: auto; }}
   tr:nth-child(even) td {{ background-color: #F8FAFC; }}
   th {{
-    background-color: #1E3A8A;
-    color: #FFFFFF;
-    font-weight: bold;
-    font-size: 11.5pt;
+      background-color: #1E3A8A;
+      color: #FFFFFF;
+      font-weight: bold;
+      font-size: 11.5pt;
   }}
   .info-table td:first-child {{
-    font-weight: bold;
-    background-color: #E2E8F0 !important;
-    color: #1E3A8A;
-    width: 22%;
+      font-weight: bold;
+      background-color: #EFF6FF;
+      color: #1E3A8A;
+      width: 22%;
+      border-left: 2px solid #93C5FD;
   }}
   .summary-strip td {{
-    background-color: #F8FAFC !important;
-    text-align: center;
-    width: 25%;
-    border: 1.5px solid #94A3B8;
-    padding: 12px 8px;
+      background-color: #F8FAFC;
+      text-align: center;
+      width: 25%;
+      padding: 12px 10px;
+      border-top: 4px solid #1E3A8A;
   }}
+  .summary-strip td:nth-child(1) {{ background-color: #EFF6FF; border-top-color: #2563EB; }}
+  .summary-strip td:nth-child(2) {{ background-color: #F0FDFA; border-top-color: #0D9488; }}
+  .summary-strip td:nth-child(3) {{ background-color: #F0FDF4; border-top-color: #16A34A; }}
+  .summary-strip td:nth-child(4) {{ background-color: #FFFBEB; border-top-color: #D97706; }}
   .summary-strip .label {{
-    font-size: 10pt;
-    color: #475569;
-    display: block;
-    margin-bottom: 4px;
-    font-weight: bold;
+      font-size: 10.5pt;
+      color: #475569;
+      font-weight: bold;
+      display: block;
+      margin-bottom: 4px;
   }}
   .summary-strip .val {{
-    font-size: 13pt;
-    font-weight: bold;
-    color: #1E3A8A;
+      font-size: 13.5pt;
+      font-weight: bold;
+      color: #0F172A;
   }}
   .core-grid td {{
-    width: 33.33%;
-    background-color: #EFF6FF !important;
-    color: #1E3A8A;
-    font-weight: bold;
-    text-align: center;
-    padding: 10px;
+      width: 33.33%;
+      background-color: #F1F5F9;
+      color: #1E3A8A;
+      font-weight: bold;
+      text-align: center;
+      padding: 11px;
+      font-size: 12pt;
   }}
   .score-cell {{
-    text-align: center;
-    font-weight: bold;
-    color: #1E3A8A;
-    background-color: #EFF6FF !important;
-    font-size: 12pt;
-    white-space: nowrap;
-  }}
-  .ts-badge {{
-    display: inline-block;
-    background-color: #E0F2FE;
-    color: #0369A1;
-    border: 1px solid #BAE6FD;
-    padding: 1px 6px;
-    border-radius: 4px;
-    font-family: Consolas, monospace;
-    font-size: 10.5pt;
-    font-weight: bold;
+      text-align: center;
+      font-weight: bold;
+      color: #1E3A8A;
+      background-color: #EFF6FF !important;
+      font-size: 11.5pt;
   }}
   ul {{ margin-top: 6px; margin-bottom: 8px; padding-right: 22px; }}
   li {{ margin-bottom: 8px; page-break-inside: avoid; }}
 </style>
 </head>
-<body>{cleaned}</body>
+<body>{cleaned_body}</body>
 </html>"""
 
 
@@ -1813,22 +1769,28 @@ def main():
         send_telegram(f"🚀 بدء معالجة حلقة: {CLEAN_NAME}\n⚙️ {MODE_TITLE}", use_html=False)
         log_step(f"انطلاق معالجة الحلقة: {CLEAN_NAME} | {MODE_TITLE}")
 
-        _ = get_prioritized_keys(check_live_quota=False)
+        _ = get_prioritized_keys()
 
-        folder_meta = get_drive_folder_metadata()
-        folder_desc = folder_meta.get("description", "") or ""
-
-        all_files = list_drive_folder_contents()
-        drive_files = [f for f in all_files if f.get("mimeType", "").startswith("video/") or f.get("mimeType", "").startswith("audio/")]
-        drive_files.sort(key=lambda x: x["name"])
-
+        drive_files = []
         external_url, url_source = (None, None)
-        if not drive_files:
+        for wait_attempt in range(10):
+            folder_meta = get_drive_folder_metadata()
+            folder_desc = folder_meta.get("description", "") or ""
+            all_files = list_drive_folder_contents()
+            drive_files = [f for f in all_files if f.get("mimeType", "").startswith("video/") or f.get("mimeType", "").startswith("audio/")]
+            drive_files.sort(key=lambda x: x["name"])
+
             external_url, url_source = find_video_url_in_folder(all_files, folder_desc=folder_desc)
-            if not external_url:
-                raise RuntimeError(
-                    "المجلد لا يحتوي على رابط فيديو في وصف المجلد (Folder Description) ولا مستند Google Doc ولا ملف نصي ولا ملف فيديو مرفوع."
-                )
+            if external_url or drive_files:
+                break
+            if wait_attempt == 0:
+                log_step("⏳ بانتظار ظهور رابط الفيديو في وصف المجلد (Folder Description) أو اكتمال رفع الملف (مهلة سماح 45 ثانية)...")
+            time.sleep(5)
+
+        if not external_url and not drive_files:
+            raise RuntimeError(
+                "المجلد لا يحتوي على رابط فيديو في وصف المجلد (Folder Description) ولا مستند Google Doc ولا ملف نصي ولا ملف فيديو مرفوع."
+            )
 
         segments, exact_duration = prepare_media_segments(drive_files, external_url=external_url, url_source=url_source)
         total_segs_count = len(glob.glob("Audio_part*.mp3")) + len(glob.glob("Visuals_part*.mp4"))
@@ -1837,6 +1799,13 @@ def main():
 
         log_step(f"✅ تم بنجاح تحليل كامل مقاطع الحلقة ({total_segs_count} جزء) بمدة ({exact_duration})!")
 
+        main_html = wrap_html(f"تقييم تفصيلي - {CLEAN_NAME}", result.get("thinkingBanner", "") + result["mainDetailedHtml"])
+        sum_html = wrap_html(f"تقرير مختصر - {CLEAN_NAME}", result.get("thinkingBanner", "") + result["summarizedHtml"])
+
+        last_spoken = result.get("lastSpokenWords", "غير متوفر").strip()
+        elapsed = int(time.time() - START_TIME)
+        elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
+
         cost_info = result.get("costInfo", {
             "keyLabel": "FREE",
             "modelUsed": "gemini-3.8-flash",
@@ -1844,36 +1813,22 @@ def main():
             "processCost": 0.0,
             "totalMonthly": get_monthly_spend()
         })
-        actual_cost = float(cost_info.get("processCost", 0.0))
 
-        main_html = beautify_and_wrap_html(
-            f"تقييم تفصيلي - {CLEAN_NAME}",
-            result.get("thinkingBanner", "") + result["mainDetailedHtml"],
-            run_cost_usd=actual_cost
-        )
-        sum_html = beautify_and_wrap_html(
-            f"تقرير مختصر - {CLEAN_NAME}",
-            result.get("thinkingBanner", "") + result["summarizedHtml"],
-            run_cost_usd=actual_cost
-        )
-
-        last_spoken = result.get("lastSpokenWords", "غير متوفر").strip()
-        elapsed = int(time.time() - START_TIME)
-        elapsed_str = f"{elapsed // 60} دقيقة و {elapsed % 60} ثانية"
+        actual_cost = round(float(cost_info.get("processCost", 0.0)), 4)
+        monthly_tot = round(float(cost_info.get("totalMonthly", get_monthly_spend())), 4)
 
         summary_json_data = {
             "status": "SUCCESS",
             "folder_name": CLEAN_NAME,
+            "editorial_type": EDITORIAL_TYPE_LABEL,
             "mode_title": MODE_TITLE,
             "level_name": MODE_TITLE,
             "model_used": cost_info.get("modelUsed", ""),
             "key_label": cost_info["keyLabel"],
             "processCost": actual_cost,
             "process_cost_usd": actual_cost,
-            "cost_usd": actual_cost,
-            "total_cost_usd": actual_cost,
             "episode_budget_usd": EPISODE_MAX_COST,
-            "monthly_spend_usd": cost_info["totalMonthly"],
+            "monthly_spend_usd": monthly_tot,
             "monthly_cap_usd": MAX_MONTHLY_BUDGET,
             "duration_hms": exact_duration,
             "segments_count": total_segs_count,
@@ -1881,21 +1836,19 @@ def main():
             "last_spoken_words": last_spoken
         }
 
-        # 1. تأمين النسخ الاحتياطية (GitHub Artifacts + Telegram Document + SMTP) قبل لمس Google Drive
         save_bulletproof_backups(main_html, sum_html, summary_json_data)
 
-        # 2. رفع التقريرين وملف _run_summary.json إلى Google Drive أولاً قبل تغيير اسم المجلد
         upload_report_to_drive(f"01_Main_Detailed_Report_{CLEAN_NAME}.html", main_html, "text/html")
         upload_report_to_drive(f"02_Summarized_Report_{CLEAN_NAME}.html", sum_html, "text/html")
         upload_report_to_drive("_run_summary.json", json.dumps(summary_json_data, ensure_ascii=False, indent=2), "application/json")
 
-        # 3. تحديث اسم المجلد ووصفه متضمناً COST_USD الصريح ليلتقطه Code.gs فوراً بدون ظهور $0.00
         summary_desc = (
-            f"COST_USD: ${actual_cost:.4f} | MONTH_USD: ${cost_info['totalMonthly']:.4f}\n"
+            f"COST_USD: ${actual_cost:.4f} | MONTHLY_USD: ${monthly_tot:.4f}\n"
+            f"• نوع التقييم: {EDITORIAL_TYPE_LABEL}\n"
             f"• المنظومة المختارة: {MODE_TITLE}\n"
             f"• الحساب والنموذج المستخدم: {cost_info['keyLabel']} ({cost_info.get('modelUsed', '')})\n"
             f"• تكلفة هذه العملية: ${actual_cost:.4f} (سقف الحلقة المحدد: ${EPISODE_MAX_COST:.2f})\n"
-            f"• إجمالي الإنفاق هذا الشهر: ${cost_info['totalMonthly']:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
+            f"• إجمالي الإنفاق هذا الشهر: ${monthly_tot:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
             f"• عدد المقاطع المحللة: {total_segs_count} جزء\n"
             f"• المدة الإجمالية للحلقة: {exact_duration}\n"
             f"• الوقت المستغرق: {elapsed_str}\n"
@@ -1903,14 +1856,15 @@ def main():
         )
         update_drive_folder(f"PROCESSED_{CLEAN_NAME}", summary_desc)
 
-        folder_url = _u(f"https://drive.google.com/drive/folders/{FOLDER_ID}")
+        folder_url = f"https://drive.google.com/drive/folders/{FOLDER_ID}"
         send_telegram(
             f"✅ تمت المعالجة والتقييم بنجاح!\n"
             f"📌 الحلقة: {CLEAN_NAME}\n"
+            f"⚖️ المعيار: {EDITORIAL_TYPE_LABEL}\n"
             f"⚙️ المنظومة: {MODE_TITLE}\n"
             f"🔑 الحساب المستخدم: {cost_info['keyLabel']} ({cost_info.get('modelUsed', '')})\n"
             f"💵 تكلفة العملية الحالية: ${actual_cost:.4f} (سقف الحلقة: ${EPISODE_MAX_COST:.2f})\n"
-            f"📊 إجمالي الإنفاق هذا الشهر: ${cost_info['totalMonthly']:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
+            f"📊 إجمالي الإنفاق هذا الشهر: ${monthly_tot:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
             f"⏱️ المدة: {exact_duration} | الاستغراق: {elapsed_str}\n\n"
             f"🎙️ آخر كلام في الحلقة:\n«{last_spoken}»\n\n"
             f"📁 رابط المجلد:\n{folder_url}",
@@ -1923,6 +1877,7 @@ def main():
         fail_summary = {
             "status": "FAILED",
             "folder_name": CLEAN_NAME,
+            "editorial_type": EDITORIAL_TYPE_LABEL,
             "mode_title": MODE_TITLE,
             "process_cost_usd": 0.0,
             "monthly_spend_usd": current_monthly,
@@ -1933,7 +1888,7 @@ def main():
         upload_report_to_drive("_run_summary.json", json.dumps(fail_summary, ensure_ascii=False, indent=2), "application/json")
 
         fail_desc = (
-            f"COST_USD: $0.0000\n"
+            f"• نوع التقييم: {EDITORIAL_TYPE_LABEL}\n"
             f"• المنظومة المختارة: {MODE_TITLE}\n"
             f"• إجمالي الإنفاق هذا الشهر: ${current_monthly:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
             f"• تفاصيل السبب:\n{error_msg[:1500]}"
@@ -1942,6 +1897,7 @@ def main():
 
         raw_fail_msg = (
             f"❌ فشل معالجة الحلقة: {CLEAN_NAME}\n"
+            f"⚖️ المعيار: {EDITORIAL_TYPE_LABEL}\n"
             f"⚙️ المنظومة: {MODE_TITLE}\n"
             f"📊 إجمالي الإنفاق هذا الشهر: ${current_monthly:.4f} / ${MAX_MONTHLY_BUDGET:.2f}\n"
             f"⚠️ تفاصيل الخطأ:\n{error_msg[:3000]}"
