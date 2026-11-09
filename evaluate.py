@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-منظومة تقييم مقدمي البرامج التلفزيونية المحصنة (evaluate.py) - تدعم المنظومة الثانية (موجهة) والمنظومة الثالثة (عامة محايدة):
+منظومة تقييم مقدمي البرامج التلفزيونية المحصنة (evaluate.py) - النسخة النهائية الكاملة:
 - إذا بدأ المجلد بـ READY_GEN_ أو GEN_READY_ (أو تضمن _gen أو _neutral): يشغّل [المنظومة الثالثة: التقييم المهني العام والمحايد بدون خلفية قناة موجهة].
 - إذا بدأ المجلد بـ READY_ العادية: يشغّل [المنظومة الثانية: التقييم مع مراعاة الخط التحريري للقناة الموجهة].
+- سحب مضمون 100% للرابط من وصف المجلد (Folder Description) ومن ملف _source_link.txt أو Google Doc أو ملف نصي.
+- دعم كامل لروابط يوتيوب (عبر yt-dlp المطور + التمرير المباشر لخوادم Gemini عند حظر IP السحابة).
 - فحص لحظي (0.5 ثانية - 1 توكن) للكوتا والميزانية قبل رفع أي ملف لمنع إضاعة الوقت في الرفع المتكرر.
 - تثبيت قاعدة اللهجة اللبنانية المحكية + التصميم التنفيذي الملون (Royal Executive RTL Theme) + النسخ الاحتياطي الرباعي.
 """
@@ -847,6 +849,12 @@ def extract_url_from_text(text):
 
 
 def find_video_url_in_folder(all_files, folder_desc=""):
+    """
+    قراءة مضمونة 100% للرابط من:
+    1. وصف المجلد (Folder Description) مباشرة.
+    2. ملف _source_link.txt الذي ينشئه Code.gs تلقائياً من الوصف.
+    3. أي مستند Google Doc أو ملف نصي داخل المجلد.
+    """
     global ORIGINAL_SOURCE_URL
     headers = {"Authorization": f"Bearer {DRIVE_TOKEN}"}
 
@@ -868,7 +876,7 @@ def find_video_url_in_folder(all_files, folder_desc=""):
 
     for f in all_files:
         fname = f.get("name", "")
-        if fname.startswith("00_") or fname.startswith("_") or fname.endswith(".html") or fname.endswith(".json"):
+        if fname.startswith("00_") or fname == "_run_summary.json" or fname.endswith(".html") or fname.endswith(".json"):
             continue
         mime = f.get("mimeType", "")
         try:
@@ -884,7 +892,7 @@ def find_video_url_in_folder(all_files, folder_desc=""):
                     if url:
                         ORIGINAL_SOURCE_URL = url
                         return url, f"مستند Google Doc ({fname})"
-            elif mime.startswith("text/") or fname.lower().endswith((".txt", ".url", ".webloc", ".md")):
+            elif fname == "_source_link.txt" or mime.startswith("text/") or fname.lower().endswith((".txt", ".url", ".webloc", ".md")):
                 r = session.get(
                     f"https://www.googleapis.com/drive/v3/files/{f['id']}?alt=media",
                     headers=headers,
@@ -894,7 +902,8 @@ def find_video_url_in_folder(all_files, folder_desc=""):
                     url = extract_url_from_text(r.text)
                     if url:
                         ORIGINAL_SOURCE_URL = url
-                        return url, f"الملف النصي ({fname})"
+                        src_label = "وصف المجلد (_source_link.txt)" if fname == "_source_link.txt" else f"الملف النصي ({fname})"
+                        return url, src_label
         except Exception:
             pass
 
@@ -942,7 +951,13 @@ def download_drive_file(file_id, local_path):
                     f.write(chunk)
 
 
+def is_youtube_url(url):
+    u = str(url or "").lower()
+    return ("youtube.com/watch" in u) or ("youtu.be/" in u) or ("youtube.com/live/" in u) or ("youtube.com/shorts/" in u)
+
+
 def download_video_from_external_url(url, local_path):
+    # 1. إذا كان الرابط لملف على Google Drive
     gdrive_match = re.search(r'(?:/file/d/|id=)([a-zA-Z0-9_-]{20,})', url)
     if gdrive_match and "drive.google.com" in url:
         file_id = gdrive_match.group(1)
@@ -954,6 +969,7 @@ def download_video_from_external_url(url, local_path):
         except Exception as e:
             log_step(f"⚠️ تعذر السحب المباشر عبر API ({str(e)[:40]})، جاري المحاولة عبر yt-dlp...")
 
+    # 2. إذا كان رابط ميديا مباشر (MP4 / MOV / MKV / TS)
     is_direct_media = url.lower().split("?")[0].endswith((".mp4", ".mov", ".mkv", ".mp3", ".m4a", ".ts"))
     if is_direct_media:
         try:
@@ -971,17 +987,20 @@ def download_video_from_external_url(url, local_path):
         except Exception as e:
             log_step(f"⚠️ التحويل إلى الفحص المباشر عبر FFprobe/yt-dlp ({str(e)[:40]})...")
 
-    try:
-        probe_chk = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", url],
-            capture_output=True, text=True, timeout=25
-        )
-        if probe_chk.returncode == 0 and float(probe_chk.stdout.strip() or 0) > 0:
-            log_step("⚡ الرابط يدعم البث/التقطيع المباشر عبر FFmpeg (مثل منظومة البرودكاست تماماً)!")
-            return url
-    except Exception:
-        pass
+    # 3. فحص ما إذا كان الرابط يقبل التقطيع المباشر عبر FFmpeg (لغير يوتيوب)
+    if not is_youtube_url(url):
+        try:
+            probe_chk = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", url],
+                capture_output=True, text=True, timeout=25
+            )
+            if probe_chk.returncode == 0 and float(probe_chk.stdout.strip() or 0) > 0:
+                log_step("⚡ الرابط يدعم البث/التقطيع المباشر عبر FFmpeg!")
+                return url
+        except Exception:
+            pass
 
+    # 4. السحب عبر yt-dlp مع محاكاة تطبيقات الموبايل لتخطي حظر يوتيوب
     log_step("⚙️ تجهيز محرك السحب السحابي (yt-dlp) وسحب الحلقة من الرابط...")
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp"], check=False)
     if os.path.exists(local_path):
@@ -991,16 +1010,23 @@ def download_video_from_external_url(url, local_path):
         sys.executable, "-m", "yt_dlp",
         "--no-playlist",
         "--no-check-certificates",
+        "--extractor-args", "youtube:player_client=ios,android,mweb,tv",
         "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
         "-o", local_path,
         url
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0 or not os.path.exists(local_path):
-        err_tail = (res.stderr or res.stdout or "خطأ غير معروف")[-300:]
-        raise RuntimeError(f"فشل سحب الفيديو من الرابط ({url}):\n{err_tail}")
-    return local_path
+    if res.returncode == 0 and os.path.exists(local_path) and os.path.getsize(local_path) > 100_000:
+        return local_path
+
+    # 5. إذا كان الرابط هو رابط يوتيوب وحظر يوتيوب عنوان IP خادم GitHub، نمرر الرابط مباشرة إلى خوادم Gemini!
+    if is_youtube_url(url):
+        log_step("⚡ يوتيوب قيّد التحميل المباشر على IP الخادم — سيتم تمرير رابط YouTube مباشرة إلى محرك Gemini لتحليله من خوادم جوجل!")
+        return f"DIRECT_YOUTUBE_URI::{url}"
+
+    err_tail = (res.stderr or res.stdout or "خطأ غير معروف")[-300:]
+    raise RuntimeError(f"فشل سحب الفيديو من الرابط ({url}):\n{err_tail}")
 
 
 def get_duration_seconds(filepath_or_url):
@@ -1019,6 +1045,9 @@ def prepare_media_segments(drive_files, external_url=None, url_source=None):
     if external_url:
         log_step(f"🔗 تم التقاط رابط الحلقة من {url_source}:\n{external_url}")
         media_input = download_video_from_external_url(external_url, local_raw)
+
+        if str(media_input).startswith("DIRECT_YOUTUBE_URI::"):
+            return [media_input], "كامل مدة فيديو يوتيوب"
 
         if media_input == local_raw and os.path.exists(local_raw):
             size_mb = os.path.getsize(local_raw) / (1024 * 1024)
@@ -1084,6 +1113,10 @@ def prepare_media_segments(drive_files, external_url=None, url_source=None):
 
 
 def upload_to_gemini_file_api(filepath, api_key):
+    if str(filepath).startswith("DIRECT_YOUTUBE_URI::"):
+        yt_url = filepath.split("DIRECT_YOUTUBE_URI::", 1)[1]
+        return yt_url, "video/mp4"
+
     mime = "audio/mp3" if filepath.endswith(".mp3") else "video/mp4"
     filesize = os.path.getsize(filepath)
 
@@ -1160,6 +1193,9 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
         end_str = format_hhmmss(accum_sec + dur)
         seg_timeline_info.append(f"- الجزء {idx:02d} ({aseg}): [{start_str}] -> [{end_str}]")
         accum_sec += dur
+    if not seg_timeline_info:
+        accum_sec = 3600.0
+        seg_timeline_info.append(f"- الحلقة كاملة متصلة من البداية حتى النهاية ({exact_duration})")
     timeline_map_str = "\n".join(seg_timeline_info)
 
     est_in_tokens = int((accum_sec * 295) + 4800)
@@ -1232,12 +1268,12 @@ def evaluate_standard_pro_mode(segments, exact_duration, total_segments_count):
         if not probe_ok:
             continue
 
-        log_step(f"✅ المفتاح {key_label} اجتاز الفحص اللحظي بنجاح! جاري رفع المقاطع الآن...")
+        log_step(f"✅ المفتاح {key_label} اجتاز الفحص اللحظي بنجاح! جاري تجهيز/رفع المقاطع الآن...")
 
         try:
             prompt_parts = []
             for seg in segments:
-                log_step(f"☁️ رفع الجزء ({seg}) إلى Gemini باستخدام {key_label}...")
+                log_step(f"☁️ ربط/رفع الجزء ({seg}) إلى Gemini باستخدام {key_label}...")
                 uri, mime = upload_to_gemini_file_api(seg, api_key)
                 prompt_parts.append({"text": f"الملف المرفق التالي هو: {seg}"})
                 prompt_parts.append({"fileData": {"mimeType": mime, "fileUri": uri}})
@@ -1414,6 +1450,9 @@ def call_gemini_low_mode_step(system_prompt, user_parts_builder, models_list, st
 
 
 def evaluate_low_free_mode(segments, exact_duration, total_segments_count):
+    if len(segments) == 1 and str(segments[0]).startswith("DIRECT_YOUTUBE_URI::"):
+        return evaluate_standard_pro_mode(segments, exact_duration, total_segments_count)
+
     models = [
         ("gemini-3.8-flash", 0,    "gemini-3.8-flash (Standard Fast)", True),
         ("gemini-3.8-flash", 8192, "gemini-3.8-flash (Thinking 8192)", False),
@@ -1793,7 +1832,7 @@ def main():
             )
 
         segments, exact_duration = prepare_media_segments(drive_files, external_url=external_url, url_source=url_source)
-        total_segs_count = len(glob.glob("Audio_part*.mp3")) + len(glob.glob("Visuals_part*.mp4"))
+        total_segs_count = len(segments)
 
         result = evaluate_with_gemini(segments, exact_duration, total_segs_count)
 
